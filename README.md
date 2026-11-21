@@ -66,7 +66,9 @@ has one row per work item, with lines on the left joining an item to the items
 it waits for. Each row takes its state from the session working on that work
 item: running, needs you, done or ended. Rows without a session show whether the
 item starts on your go, waits for another item, is on hold or is skipped.
-Clicking a row opens its session.
+Clicking a row opens its session. A row finds its session by work item number: the
+session's `#1234` in its prompt, or the issue URL or number its skill was started
+with, such as `/deliver https://github.com/owner/repo/issues/12`.
 
 While the plan waits for your go or your answers, the orchestrating session
 counts as **needs you** and its questions show on the plan. Your next prompt in

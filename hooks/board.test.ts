@@ -19,6 +19,9 @@ describe('summaries', () => {
     expect(workItemOf('continue on #1234', false)).toBe('1234')
     expect(workItemOf('deliver 1234', false)).toBe(null)
     expect(workItemOf('1234, use autocomplete', true)).toBe('1234')
+    // /deliver as orchestrate-delivery starts it: the issue URL wins over other digits.
+    expect(workItemOf('https://github.com/o/r/issues/12 medium report-to=orch-2024 name=dlv-12', true)).toBe('12')
+    expect(workItemOf('see https://github.com/o/r/issues/12', false)).toBe(null)
   })
 })
 
