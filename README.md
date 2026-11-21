@@ -66,13 +66,72 @@ has one row per work item, with lines on the left joining an item to the items
 it waits for. Each row takes its state from the session working on that work
 item: running, needs you, done or ended. Rows without a session show whether the
 item starts on your go, waits for another item, is on hold or is skipped.
-Clicking a row opens its session.
+Clicking a row opens its session. A row finds its session by work item number: the
+session's `#1234` in its prompt, or the issue URL or number its skill was started
+with, such as `/deliver https://github.com/owner/repo/issues/12`.
 
 While the plan waits for your go or your answers, the orchestrating session
 counts as **needs you** and its questions show on the plan. Your next prompt in
 that session clears this. The board only shows the plan; it starts nothing, and
 it works under `python -m http.server` too. The tool is deferred, so sessions
 that never plan get no extra context.
+
+#### Writing an orchestrator skill for the board
+
+The board draws what the plan says and fills in each row from the session on
+that work item. A skill that keeps to these rules gets a plan that stays right
+without being told about progress:
+
+- **Send the whole plan each time.** Each call replaces the last one. Call it
+  when the plan itself changes: when you show it, after the go, when items are
+  added, held, released, reordered or skipped, and with `clear: true` when the
+  run is over. Don't call it to report progress: a row reads running, needs
+  you, done or ended from its session.
+- **Name each item by its number alone**: `12`, not `owner/repo#12` or a URL,
+  which are dropped. That number is how the row finds its session, so start
+  each session with the number in its prompt (`#1234`) or its skill args (an
+  issue URL, or a 4–7 digit number). Two repos' `#12` in one plan share a row.
+- **Pick the start that says why an item waits.** `now`: nothing to wait for
+  (it shows "starts on your go" while the plan waits for one). `later` with
+  `after`: it waits for items in the plan, and the row clears once each of
+  those sessions reports done. `hold` with a one-line `reason` (shown on
+  hover): it waits for something the board can't see, such as an issue outside
+  the plan, a cycle, the person, or a question (`question` is its 1-based
+  number in `questions`). `skip` with a `reason`: it gets no session.
+- **Mind what done means.** `after` clears when the blocker's session calls
+  `board_status` with `done`, which a delivery may do once its PR is open for
+  review. If your skill waits for the merge instead, put the items that wait on
+  that blocker on `hold` ("waits for #12 to merge") until it merges.
+- **One session for several issues:** give the issue the session is started
+  with a row, and each other issue a `skip` row ("in #12's PR"), so the
+  whole set shows.
+- **Waiting for the go:** `waitingForGo: true` or any `questions` shows the
+  orchestrator as **needs you** and lists the questions. The person's next
+  prompt clears that; call again without `waitingForGo` once the plan goes
+  ahead, and keep any question you ask again.
+- `proposed: true` marks an order you suggested that the person hasn't
+  approved yet. `type` is a short label (`Bug`, `User Story`, `Task`, …).
+
+The tool is deferred: load it through tool search (`board_plan`), and skip
+it when it isn't there, so the skill still runs without the board. A plan
+waiting for the go, in which #13 waits for #12, #14 waits for an outside issue
+and #15 ships in #12's PR:
+
+```json
+{
+  "title": "Search improvements",
+  "workItem": "10",
+  "waitingForGo": true,
+  "questions": ["Should #16 keep the old endpoint?"],
+  "items": [
+    { "workItem": "12", "title": "Index titles", "type": "Bug", "start": "now" },
+    { "workItem": "13", "title": "Rank by recency", "start": "later", "after": ["12"] },
+    { "workItem": "14", "title": "Search tags", "start": "hold", "reason": "waits on other/repo#9, outside the plan" },
+    { "workItem": "16", "title": "New endpoint", "start": "hold", "question": 1 },
+    { "workItem": "15", "title": "Index aliases", "start": "skip", "reason": "in #12's PR" }
+  ]
+}
+```
 
 ### Queue work items from the board
 

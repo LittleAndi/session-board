@@ -292,8 +292,13 @@ export function addMessage(board: Board, rec: MessageRec): boolean {
   return true
 }
 
-// A work item id: "#1234" anywhere, or a bare 4–7 digit number in skill args.
+// A work item id: "#1234" anywhere, or in skill args a GitHub issue URL (its
+// number, without the repo, as plan items name it) or a bare 4–7 digit number.
+// /deliver from orchestrate-delivery names its issue by URL, and GitHub issue
+// numbers are often too short for the other two forms.
 export function workItemOf(text: string, allowBare: boolean): string | null {
+  const issue = allowBare ? text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/(\d{1,7})\b/i) : null
+  if (issue?.[1]) return issue[1]
   const hash = text.match(/#(\d{3,7})\b/)
   if (hash?.[1]) return hash[1]
   if (!allowBare) return null
@@ -873,7 +878,7 @@ export const BOARD_PLAN_TOOL = {
         items: {
           type: 'object',
           properties: {
-            workItem: { type: 'string', description: 'The work item number.' },
+            workItem: { type: 'string', description: 'The work item or GitHub issue number, digits only (5, not owner/repo#5).' },
             title: { type: 'string' },
             type: { type: 'string', description: 'Bug, User Story, Task, ...' },
             start: {

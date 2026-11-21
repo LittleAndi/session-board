@@ -37,7 +37,11 @@ install it and how to serve the page. This file is for working on it.
   fields into HTML unescaped. The server never reads `sandboxed/`.
   A session's `plan` draws as a strip above the tiles of its group (`planOf`
   checks its shape, `planHtml` draws it). Each item's state comes from the
-  newest session reporting that work item, one outside a sandbox first. The
+  newest session reporting that work item, one outside a sandbox first.
+  A session's work item is `workItemOf` its skill args or prompt: `#1234`, a
+  GitHub issue URL in skill args (so `/deliver https://github.com/o/r/issues/12`
+  is `12`) or a bare 4–7 digit number in skill args. Plan items name work items
+  by number alone, so two repos' `#12` in one plan are the same row. The
   board starts nothing from a plan.
 - `server/serve.py`: optional stdlib server for the board folder, but `/`
   comes from `dashboard/index.html` in the repo. It turns off `SO_REUSEADDR` on
