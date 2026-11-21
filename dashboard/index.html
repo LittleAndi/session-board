@@ -1447,7 +1447,10 @@ function planItemState(item, plan, bySession) {
     const word = s.state === 'waiting' ? (s.waiting?.kind === 'plan' ? 'plan to approve' : 'needs you') : STATE_WORD[s.state]
     return { cls: s.state, s, text: `${esc(word)} <span class="t">${live(s.stateSince)}</span>` }
   }
-  if (item.start === 'hold') return { cls: 'hold', text: 'on hold' + (item.question ? ' · Q' + item.question : '') }
+  if (item.start === 'hold') {
+    const what = 'on hold' + (item.question ? ' · Q' + item.question : '')
+    return { cls: 'hold', text: item.reason ? `<span title="${esc(item.reason)}">${what}</span>` : what }
+  }
   const open = item.after.filter((id) => !bySession.get(id)?.done)
   if (open.length) {
     return { cls: 'later', text: (item.proposed ? '<span class="tag">proposed</span>' : '') + 'after ' + open.map((id) => '#' + esc(id)).join(', ') }
