@@ -50,6 +50,7 @@ import {
   shellToolDone,
   skillWorkItem,
   slashCommand,
+  housekeepingCommand,
   summarize,
   toolLabel,
   trimAgents,
@@ -535,9 +536,18 @@ async function turnStarted($: EngineInterface, text: string) {
   mainRunning = true
   mainTurnId = null
   skillSetThisTurn = false
+  const handback = /^\s*<(agent-message|task-notification)[\s>]/.test(text)
+  // A housekeeping command such as /rename tends to the session: it is no new
+  // task, no turn of work and no reply, so it leaves the board as it was.
+  const slash = handback || crossSessionMessage(text) ? null : slashCommand(text)
+  if (slash && housekeepingCommand(slash.name)) {
+    event('session', `/${slash.name} ${slash.args}`.trim())
+    notePrs(prLinksOf(text))
+    schedule($)
+    return
+  }
   b.turns++
   b.waiting = null
-  const handback = /^\s*<(agent-message|task-notification)[\s>]/.test(text)
   const fired = cronFired(b, text, now())
   if (fired) event('turn', `${fired.human} fired`)
   // Another session's message or a notice about one: not the person's prompt.
@@ -554,7 +564,6 @@ async function turnStarted($: EngineInterface, text: string) {
     event(shell ? 'tool' : 'agent', shell ? `background done: ${shell.summary}` : `report from ${agentName(from) ?? 'a subagent'}`)
     notePrs(prLinksOf(text), agentName(from))
   } else if (text.trim()) {
-    const slash = slashCommand(text)
     const shown = slash ? `/${slash.name} ${slash.args}`.trim() : text
     b.prompt = clip(shown, 600)
     b.promptAt = now()
