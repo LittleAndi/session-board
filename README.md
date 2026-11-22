@@ -344,8 +344,10 @@ regular expressions:
 The dashboard reads it once when the page loads; reload the page after editing.
 A missing or broken file leaves the defaults.
 
-The work item is taken from the skill's arguments (`deliver 1234` →
-`#1234`) or a `#1234` in the prompt.
+The work item is taken from the arguments of a delivery or orchestrate skill
+(`/deliver 1234` → `#1234`) or a `#1234` in the prompt. Another skill's bare
+number is not a work item, and neither is any number given to a review or PR
+skill, such as the PR in `/code-review high 1234` or `/code-review #1234`.
 
 ## Sessions in a sandbox
 
