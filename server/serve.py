@@ -6,7 +6,7 @@
 GET serves the board folder like `python -m http.server`, directory index
 included, so the page reads `sessions/` the same way.
 
-GET  api/queue -> {"prompt", "maxSessions", "held", "projects": [{"path", "name", "max"}], "items": [...]}
+GET  api/queue -> {"prompt", "maxSessions", "held", "projects": [{"path", "name", "max", "busy"}], "items": [...]}
 POST api/queue {"action": "add", "workItem": "1234", "cwd": "<a path from projects>"}
                {"action": "cancel" | "first" | "release", "id": "<item id>"}
                {"action": "limit", "cwd": "<a path from projects>", "max": 2}
@@ -20,8 +20,11 @@ tab (or a new console window without it). The session then writes its own
 status file, which says when the slot is free again: the session called the
 board's board_status tool with "done" and its turn ended; it sat idle for
 --idle-minutes with nothing in the background or scheduled; it ended; or it
-stopped writing. "release" frees a slot by hand. Only items count against the
-limits, not sessions started some other way. While the newest memory sample a
+stopped writing. "release" frees a slot by hand. A session started some other
+way (by hand, or a /deliver outside the queue) takes a slot too while it is on a
+work item and would hold one by the same rules ("busy" per project); an idle chat
+session without a work item doesn't, nor does one with a plan. Against
+--max-sessions it counts only while its project has items queued or running. While the newest memory sample a
 session wrote shows RAM or commit charge too high, nothing new starts ("held").
 The queue is kept in queue.json in
 the board folder, so a restart picks it up.
@@ -61,6 +64,7 @@ TICK_S = 5
 GONE_MS = 60_000  # a status file this old belongs to a session that is gone
 START_MS = 180_000  # a started item with no status file after this never came up
 KEEP_ENDED = 20  # finished, failed and cancelled items kept for the page
+KEEP_STARTED = 500  # session ids of trimmed items, so their sessions never count as outside ones
 # Memory pressure, in percent of RAM and of the commit limit, that holds the queue:
 # no new item starts from HOLD until both drop below RELEASE. The page's header
 # strip turns orange at the same HOLD values.
@@ -204,6 +208,38 @@ def slot_free(board: dict | None, started_at: int, now: int, idle_ms: int) -> st
     return None
 
 
+def outside_sessions(board: Path, queue_items: list[dict], now: int, idle_ms: int,
+                     started: list | tuple = ()) -> dict[str, int]:
+    """How many live sessions outside the queue hold a slot, by project key.
+
+    Such a session is on a work item (`workItem` set) and would still hold its
+    slot by `slot_free`'s rules, were it a queue item. A queue item's own
+    session, in any state, never counts here, nor does one of an item `trim`
+    dropped (`started`): a released item stays released. Neither does a session
+    with a `plan`: an orchestrator works through the sessions it starts, and
+    waits on the person at its gates.
+    Projects match like `known_projects`: the repo root, else the cwd.
+    """
+    from_queue = {i.get("sessionId") for i in queue_items if i.get("sessionId")}
+    from_queue.update(s for s in started if isinstance(s, str))
+    busy: dict[str, int] = {}
+    for f in (board / "sessions").glob("*.json"):
+        try:
+            s = json.loads(f.read_text(encoding="utf-8"))
+            path = (s.get("repo") or {}).get("root") or s["cwd"]
+            sid = s.get("sessionId") or f.stem
+            if not s.get("workItem") or s.get("plan") or sid in from_queue or f.stem in from_queue:
+                continue
+            if slot_free(s, 0, now, idle_ms):
+                continue
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue  # mid-write or malformed
+        if not isinstance(path, str) or not os.path.isabs(path):
+            continue
+        busy[key(path)] = busy.get(key(path), 0) + 1
+    return busy
+
+
 def newest_machine(board: Path, now: int) -> dict | None:
     """The newest machine memory sample any session wrote, or None if none is fresh."""
     best = None
@@ -236,13 +272,19 @@ def memory_hold(machine: dict | None, held: bool) -> str | None:
     return "memory " + ", ".join(over) if over else None
 
 
-def advance(queue: dict, boards: dict, now: int, idle_ms: int, max_sessions: int, hold: bool = False) -> list[dict]:
+def advance(queue: dict, boards: dict, now: int, idle_ms: int, max_sessions: int, hold: bool = False,
+            outside: dict[str, int] | None = None) -> list[dict]:
     """Frees the slots of running items whose sessions are finished, then marks
     queued items running, in order, while there's room and no `hold`. Returns
     the items to start; the caller starts them, and marks one failed if that fails.
 
     `boards` maps a session id to its status file, for the running items' sessions.
+    `outside` counts, by project key, sessions outside the queue that hold a slot
+    (`outside_sessions`). They count against a project's limit like running
+    items, and against `max_sessions` only in projects with queued or running
+    items, so sessions in repos the queue doesn't touch never hold it up.
     """
+    outside = outside or {}
     for item in queue["items"]:
         if item["state"] != "running":
             continue
@@ -250,11 +292,13 @@ def advance(queue: dict, boards: dict, now: int, idle_ms: int, max_sessions: int
         if reason:
             item.update(state="finished", endedAt=now, endedBy=reason)
     running = [i for i in queue["items"] if i["state"] == "running"]
+    in_queue = {key(i["cwd"]) for i in queue["items"] if i["state"] in ("queued", "running")}
+    others = sum(n for k, n in outside.items() if k in in_queue)
     starting = []
     for item in queue["items"]:
-        if hold or item["state"] != "queued" or len(running) >= max_sessions:
+        if hold or item["state"] != "queued" or len(running) + others >= max_sessions:
             continue
-        here = sum(1 for i in running if key(i["cwd"]) == key(item["cwd"]))
+        here = outside.get(key(item["cwd"]), 0) + sum(1 for i in running if key(i["cwd"]) == key(item["cwd"]))
         if here >= queue["limits"].get(key(item["cwd"]), 1):
             continue
         item.update(state="running", startedAt=now, sessionId=str(uuid.uuid4()))
@@ -267,8 +311,13 @@ def trim(queue: dict) -> None:
     """Keeps every open item and the newest of the rest."""
     ended = sorted((i for i in queue["items"] if i["state"] not in ("queued", "running")),
                    key=lambda i: i.get("endedAt") or 0)
-    drop = {id(i) for i in ended[:max(0, len(ended) - KEEP_ENDED)]}
+    dropped = ended[:max(0, len(ended) - KEEP_ENDED)]
+    drop = {id(i) for i in dropped}
+    started = [s for s in queue.get("started", []) if isinstance(s, str)]
+    started += [i["sessionId"] for i in dropped if isinstance(i.get("sessionId"), str)]
     queue["items"] = [i for i in queue["items"] if id(i) not in drop]
+    if started:
+        queue["started"] = started[-KEEP_STARTED:]
 
 
 def child_env(environ=os.environ) -> dict:
@@ -320,6 +369,7 @@ class Queue:
         self.start = start
         self.lock = threading.Lock()
         self.held: str | None = None  # why memory pressure holds new starts
+        self.busy: dict[str, int] = {}  # outside sessions holding slots, by project key, as of the last step
 
     def load(self) -> dict:
         try:
@@ -334,7 +384,17 @@ class Queue:
         trim(q)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(q, indent=1), encoding="utf-8")
-        os.replace(tmp, self.path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                # On Windows a scanner or reader that has either file open for a
+                # moment makes the rename fail; it frees it within milliseconds.
+                if attempt == 9:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                time.sleep(0.05)
 
     def read_board(self, session_id: str) -> dict | None:
         try:
@@ -349,7 +409,8 @@ class Queue:
         now = int(time.time() * 1000)
         self.held = memory_hold(newest_machine(self.board, now), self.held is not None)
         live = {k: v for k, v in boards.items() if v is not None}
-        for item in advance(q, live, now, self.idle_ms, self.max_sessions, hold=self.held is not None):
+        self.busy = outside_sessions(self.board, q["items"], now, self.idle_ms, q.get("started", []))
+        for item in advance(q, live, now, self.idle_ms, self.max_sessions, hold=self.held is not None, outside=self.busy):
             prompt = self.prompt.replace("{id}", item["workItem"])
             try:
                 self.start(item["cwd"], prompt, item["sessionId"])
@@ -367,11 +428,13 @@ class Queue:
     def view(self, projects: list[dict]) -> dict:
         with self.lock:
             q = self.load()
+            busy = self.busy  # from the last tick, so a poll doesn't read every status file
         return {
             "prompt": self.prompt,
             "maxSessions": self.max_sessions,
             "held": self.held,
-            "projects": [{**p, "max": q["limits"].get(key(p["path"]), 1)} for p in projects],
+            "projects": [{**p, "max": q["limits"].get(key(p["path"]), 1), "busy": busy.get(key(p["path"]), 0)}
+                         for p in projects],
             "items": q["items"],
         }
 

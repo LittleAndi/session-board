@@ -5,11 +5,12 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import uuid
 from functools import partial
 from pathlib import Path
 
-from serve import GONE_MS, MACHINE_STALE_MS, START_MS, Handler, Queue, Server, advance, check_launch, child_env, known_projects, launch_command, memory_hold, newest_machine, same_origin, slot_free
+from serve import GONE_MS, KEEP_ENDED, MACHINE_STALE_MS, START_MS, Handler, Queue, Server, advance, check_launch, child_env, known_projects, launch_command, memory_hold, newest_machine, outside_sessions, same_origin, slot_free, trim
 
 
 def write_session(board: Path, sid: str, **fields) -> None:
@@ -225,6 +226,77 @@ class Advance(unittest.TestCase):
         self.assertEqual([i["state"] for i in q["items"]], ["finished", "queued"])
 
 
+    def test_sessions_outside_the_queue_take_slots(self):
+        a = os.path.normcase(os.path.normpath("/a"))
+        q = {"limits": {}, "items": [item(1, "/a"), item(2, "/b")]}
+        started = advance(q, {}, 10, IDLE, 4, outside={a: 1})
+        self.assertEqual([i["workItem"] for i in started], ["2"])
+        q = {"limits": {a: 2}, "items": [item(1, "/a")]}
+        self.assertEqual(len(advance(q, {}, 10, IDLE, 4, outside={a: 1})), 1)
+        x, y = (os.path.normcase(os.path.normpath(p)) for p in ("/x", "/y"))
+        q = {"limits": {}, "items": [item(1, "/a"), item(2, "/x", "running", sessionId="s2", startedAt=10)]}
+        self.assertEqual(advance(q, {}, 10, IDLE, 2, outside={x: 1, y: 1}), [])  # the global cap
+
+    def test_sessions_in_repos_the_queue_does_not_touch_leave_the_global_cap_alone(self):
+        others = {os.path.normcase(os.path.normpath(f"/r{n}")): 1 for n in range(4)}
+        q = {"limits": {}, "items": [item(1, "/a")]}
+        self.assertEqual([i["workItem"] for i in advance(q, {}, 10, IDLE, 4, outside=others)], ["1"])
+
+
+class Trim(unittest.TestCase):
+    def test_keeps_the_session_ids_of_dropped_items(self):
+        q = {"limits": {}, "items": [item(n, "/a", "finished", sessionId=f"s{n}", endedAt=n)
+                                     for n in range(KEEP_ENDED + 2)]}
+        trim(q)
+        self.assertEqual(len(q["items"]), KEEP_ENDED)
+        self.assertEqual(q["started"], ["s0", "s1"])
+        trim(q)
+        self.assertEqual(q["started"], ["s0", "s1"])
+
+
+class OutsideSessions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.board = Path(self.tmp.name)
+        self.repo = os.path.normpath(self.tmp.name + "/repo")
+        self.now = int(time.time() * 1000)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, sid, **fields):
+        fields = {"sessionId": sid, "cwd": self.repo + "/sub", "repo": {"root": self.repo, "name": "repo"},
+                  "workItem": "7", "state": "running", "updatedAt": self.now, "stateSince": self.now, **fields}
+        write_session(self.board, sid, **fields)
+
+    def test_counts_live_work_item_sessions_by_repo_root(self):
+        self.write("a")
+        self.write("b", repo=None, cwd=self.repo + os.sep)  # no repo: its cwd, normalized
+        self.write("c", state="waiting", cwd=self.tmp.name + "/other", repo=None)
+        got = outside_sessions(self.board, [], self.now, IDLE)
+        self.assertEqual(got, {os.path.normcase(self.repo): 2,
+                               os.path.normcase(os.path.normpath(self.tmp.name + "/other")): 1})
+
+    def test_ignores_idle_chats_ended_stale_finished_and_queue_items(self):
+        self.write("chat", workItem=None)
+        self.write("ended", state="ended")
+        self.write("gone", updatedAt=self.now - GONE_MS - 1)
+        self.write("done", state="idle", done={"at": 1})
+        self.write("idle", state="idle", stateSince=self.now - IDLE)
+        self.write("queued", state="running")
+        self.write("relative", cwd="relative", repo=None)
+        (self.board / "sessions" / "broken.json").write_text("{", encoding="utf-8")
+        (self.board / "sandboxed").mkdir()
+        (self.board / "sandboxed" / "x.json").write_text(json.dumps(
+            {"sessionId": "x", "cwd": self.repo, "workItem": "7", "state": "running", "updatedAt": self.now}), encoding="utf-8")
+        self.write("trimmed", state="running")
+        self.write("orchestrator", state="waiting", plan={"items": [{"workItem": "7"}], "gate": "go?"})
+        items = [item(1, self.repo, "finished", sessionId="queued")]
+        self.assertEqual(outside_sessions(self.board, items, self.now, IDLE, ["trimmed"]), {})
+        self.write("idle", state="idle", stateSince=self.now - IDLE + 60_000)  # not idle long enough yet
+        self.assertEqual(outside_sessions(self.board, items, self.now, IDLE, ["trimmed"]), {os.path.normcase(self.repo): 1})
+
+
 class MemoryHold(unittest.TestCase):
     def test_thresholds_and_release(self):
         m = lambda ram, commit: {"ramMb": ram, "ramTotalMb": 100, "commitMb": commit, "commitLimitMb": 100}
@@ -250,6 +322,23 @@ class QueueActions(unittest.TestCase):
 
     def add(self, n):
         return self.queue.act({"action": "add", "workItem": str(n), "cwd": self.repo}, self.projects)
+
+    def test_save_retries_a_refused_rename_and_cleans_up_when_it_gives_up(self):
+        real = os.replace
+        calls = []
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError(5, "Access is denied")
+            real(src, dst)
+        with mock.patch("serve.os.replace", flaky), mock.patch("serve.time.sleep"):
+            self.queue.save({"limits": {}, "items": []})
+        self.assertEqual(len(calls), 3)
+        self.assertTrue((self.board / "queue.json").exists())
+        with mock.patch("serve.os.replace", side_effect=PermissionError(5, "Access is denied")), \
+                mock.patch("serve.time.sleep"), self.assertRaises(PermissionError):
+            self.queue.save({"limits": {}, "items": []})
+        self.assertFalse((self.board / "queue.tmp").exists())
 
     def test_add_starts_the_first_and_queues_the_rest(self):
         first = self.add(1)
@@ -326,6 +415,26 @@ class QueueActions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not on PATH"):
             self.queue.act({"action": "open", "cwd": self.repo}, self.projects)
         self.assertEqual(self.started, [])
+
+    def test_a_session_started_by_hand_holds_the_slot(self):
+        write_session(self.board, "manual", sessionId="manual", cwd=self.repo, repo=None, workItem="9",
+                      state="running", updatedAt=int(time.time() * 1000))
+        self.queue.tick()
+        self.assertEqual(self.queue.view(self.projects)["projects"][0]["busy"], 1)
+        self.assertEqual(self.add(1)["state"], "queued")
+        write_session(self.board, "manual", sessionId="manual", cwd=self.repo, repo=None, workItem="9",
+                      state="ended", updatedAt=int(time.time() * 1000))
+        self.queue.tick()
+        self.assertEqual(len(self.started), 1)
+        self.assertEqual(self.queue.view(self.projects)["projects"][0]["busy"], 0)
+        # The item's own session, once it writes, is a queue item, not an outside one.
+        sid = self.started[0][2]
+        write_session(self.board, sid, sessionId=sid, cwd=self.repo, repo=None, workItem="1",
+                      state="running", updatedAt=int(time.time() * 1000))
+        self.assertEqual(self.queue.view(self.projects)["projects"][0]["busy"], 0)
+        self.add(2)
+        self.queue.tick()
+        self.assertEqual(len(self.started), 1)
 
     def test_a_failed_start_is_marked_and_frees_the_slot(self):
         def fail(*a):
