@@ -449,6 +449,45 @@ function hashRef(text: string, index: number): boolean {
   return !token.includes('://') && HASH_PREFIX.test(token)
 }
 
+// A card or phone number gives no item, though a group of it looks like one.
+// Looked at are three or more groups in a row of at most four digits, joined
+// by up to three of "-" or spaces, where a date ("2026-10-31") ends the row.
+// They are a number with a "-" among them ("1234-5678-9012", "08-1234 5678"),
+// when they open with a shorter group and end with one of four ("555 123
+// 4567", "+46 8 1234 5678"), or as four groups of four ("1234 5678 9012
+// 3456"). An item beside one still counts ("1234 5678 9012 3456 25229"), and
+// so do pairs and lists of items ("25229-25231", "30395-30396-30397",
+// "4512 4513 4514", "4512 2 3"), but four 4-digit items in a row read as a
+// card, and three joined by "-" as a phone number.
+// Gives where each group of such a number starts.
+function phoneGroups(text: string): Set<number> {
+  const found = new Set<number>()
+  for (const m of text.matchAll(/(?<![\w/.-])\d+(?:[- \t\u00a0]{1,3}\d+)+/g)) {
+    const groups: { at: number; len: number; date: boolean }[] = []
+    for (const token of m[0].matchAll(/[^ \t\u00a0]+/g)) {
+      const date = DATE.test(token[0])
+      for (const g of token[0].matchAll(/\d+/g))
+        groups.push({ at: m.index + token.index + g.index, len: g[0].length, date })
+    }
+    let from = 0
+    for (let i = 0; i <= groups.length; i++) {
+      const group = groups[i]
+      if (group && group.len <= 4 && !group.date) continue
+      const row = groups.slice(from, i)
+      const head = row[0]
+      const tail = row[row.length - 1]
+      if (head && tail && row.length >= 3) {
+        const dashed = text.slice(head.at, tail.at + tail.len).includes('-')
+        const phone = head.len < 4 && tail.len === 4
+        const card = row.length === 4 && row.every((g) => g.len === 4)
+        if (dashed || phone || card) for (const g of row) found.add(g.at)
+      }
+      from = i + 1
+    }
+  }
+  return found
+}
+
 const DATE = /^(?:(?:19|20)\d\d(?:[-/.]\d{1,2}){1,2}|(?:\d{1,2}[-/.]){1,2}(?:19|20)\d\d)$/
 
 export function workItemOf(text: string, allowBare: boolean): string | null {
@@ -456,9 +495,12 @@ export function workItemOf(text: string, allowBare: boolean): string | null {
     ? text.match(/https:\/\/(?:github\.com\/[\w.-]+\/[\w.-]+\/issues|\S+\/_workitems\/edit)\/(\d{1,7})\b/i)
     : null
   if (url?.[1]) return url[1]
+  const phone = phoneGroups(text)
   for (const m of text.matchAll(/#(\d{3,7}(?:[-/.]\d+)*)(?!\w)/g)) {
     const run = m[1] ?? ''
-    if (hashRef(text, m.index) && !DATE.test(run)) return run.split(/[-/.]/)[0] ?? null
+    const parts = run.split(/[-/.]/)
+    if (!hashRef(text, m.index) || DATE.test(run) || phone.has(m.index + 1) || parts.some((p) => p.length > 7)) continue
+    return parts[0] ?? null
   }
   if (!allowBare) return null
   const first = text.search(/\S/)
@@ -467,7 +509,7 @@ export function workItemOf(text: string, allowBare: boolean): string | null {
     // shorter part is a version, decimal or date, never an item.
     const run = m[1] ?? ''
     const parts = run.split(/[-/.]/)
-    if (DATE.test(run) || parts.some((p) => p.length < 4 || p.length > 7)) continue
+    if (DATE.test(run) || phone.has(m.index) || parts.some((p) => p.length < 4 || p.length > 7)) continue
     for (const [i, part] of parts.entries()) {
       const year = part.length === 4 && Number(part) >= 1900 && Number(part) <= 2099
       if (!year || (m.index === first && i === 0)) return part
