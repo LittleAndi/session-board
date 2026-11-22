@@ -91,6 +91,9 @@ export type Board = {
   events: BoardEvent[]
   context: { percent: number | null; tokens: number | null; window: number } | null
   costUsd: number | null
+  // costUsd as it stood when this local day began for the session, so the page
+  // can count what the session spent today. Set by costDayOf.
+  costDay?: CostDay | null
   // When the main thread last sent a request that used the prompt cache, and
   // the cache's TTL as the transcript's last cache write shows it (null: not known yet).
   cache?: { at: number; ttl: CacheTtl | null } | null
@@ -114,6 +117,34 @@ export type Board = {
   // place of the phase inferred from subagents. Cleared by done, a new slash
   // command and /clear.
   progress?: Progress | null
+}
+
+// A session's cost at the start of a local day: `day` is YYYY-MM-DD in this
+// PC's time zone, `usd` the running total costUsd then.
+export type CostDay = { day: string; usd: number }
+
+export function localDay(t: number): string {
+  const d = new Date(t)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// The day baseline after a cost refresh. `before` is costUsd as the last refresh
+// left it, `usd` the new value. On a new day the baseline is where the session
+// stood at its last refresh, at most 30 s before midnight. A session with no
+// baseline yet starts from 0 if it started today (a fresh session), otherwise
+// (a file from before costDay existed) from now. A total that went down was
+// reset: on the same day the baseline goes below 0 by what was already spent
+// today, so that spend still counts; on a new day it counts from 0.
+export function costDayOf(prev: CostDay | null | undefined, before: number | null, usd: number | null, startedAt: number, now: number): CostDay | null {
+  if (usd === null) return prev ?? null
+  const day = localDay(now)
+  const reset = before !== null && usd < before
+  if (prev && prev.day === day) {
+    if (reset) return { day, usd: prev.usd - before }
+    return usd < prev.usd ? { day, usd: 0 } : prev
+  }
+  if (!prev) return { day, usd: localDay(startedAt) === day ? 0 : usd }
+  return { day, usd: reset ? 0 : Math.min(before ?? usd, usd) }
 }
 
 // What a board_status call reported, cleaned by progressOf. Each report
