@@ -272,8 +272,11 @@ that ran 3 minutes or longer ends. **mute** silences both. Both stay set in the
 browser. A permission prompt still can't be seen (see the table above), and
 the page has to be open in a tab, served from `127.0.0.1` or `localhost`
 (browsers allow notifications only there or over HTTPS). A tab in the
-background polls every 15 s, and browsers slow its timers further after a few
-minutes, so a notification can come up to a minute late.
+background polls every 15 s, so a notification can come up to 15 s late. A
+worker times those polls, because browsers slow a background tab's own timers
+to about once a minute. A tab the browser puts to sleep (Edge's sleeping tabs,
+Chrome's Memory Saver) doesn't poll at all, so exempt the board's address
+there.
 
 On Windows a tile also shows the session's memory: its `claude.exe` plus
 everything it started (MCP servers, running shell commands), sampled once a
