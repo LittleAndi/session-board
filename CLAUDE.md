@@ -90,6 +90,15 @@ observe, `done` is the task status only the model sets. A prompt after `done`
 leaves it standing; only `board_status working` clears it. The tile shows a
 **✓ Done** badge (with `+N` prompts since) beside the activity.
 
+`board_status` also takes progress: `phase`, `step` and `of`, `workItem`.
+A call without `status` only sets `progress` (`boardStatus` and `progressOf`
+in `lib.ts`) and never touches `done`; the tool's description keeps the two
+uses apart so a step doesn't get called `done`. A subagent's progress call is
+ignored. `done`, a slash command other than `skill.name` (not a job firing)
+and `/clear` clear `progress`. The tile shows it in place of `phaseOf` while
+the session is running, waiting or in the background (an idle one may have stopped),
+formatted by `progressText`, which the page and `lib.ts` each keep in step by hand.
+
 The plugin is installed at user scope from a local marketplace (this folder), so
 every session runs this working copy. After an edit, run `/reload-plugins` in a
 session to pick it up there.
@@ -209,5 +218,3 @@ SESSION_BOARD_DIR=<scratch dir> claude -p --plugin-dir . --model haiku "<prompt 
 
 - Delete status files of long-ended sessions. `$.fs` has no delete, so this
   would need `$.process.run`, or the dashboard keeps hiding them after 24 h.
-- Let `board_status` report exact phases too, instead of phases inferred from
-  subagent types (`DEFAULT_PHASES` and `phases.json`).
