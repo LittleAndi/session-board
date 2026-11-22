@@ -35,6 +35,13 @@ install it and how to serve the page. This file is for working on it.
   sessions in a sandbox write through a mount. Those are untrusted: `defang()`
   cleans each one before anything renders it, because the page puts some
   fields into HTML unescaped. The server never reads `sandboxed/`.
+  After each poll `noteTransitions` compares with the previous one and raises
+  a desktop notification (`notify`) for a wait it saw begin (once per
+  `waiting.since`, which a plan gate keeps through short turns), never for one
+  there at the first poll, and, when **long turns** is on, for a turn
+  (`noteTurn`, one value of `turns`) that worked 3 min or more: running and
+  background count, a wait for you doesn't. Sandboxed files never notify.
+  Permission is asked from the header's **turn on**, and only in a secure context.
   A session's `plan` draws as a strip above the tiles of its group (`planOf`
   checks its shape, `planHtml` draws it). Each item's state comes from the
   newest session reporting that work item, one outside a sandbox first.
