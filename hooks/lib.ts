@@ -296,14 +296,36 @@ export function addMessage(board: Board, rec: MessageRec): boolean {
 // number, without the repo, as plan items name it) or a bare 4–7 digit number.
 // /deliver from orchestrate-delivery names its issue by URL, and GitHub issue
 // numbers are often too short for the other two forms.
+// A number that is part of a date ("2026-10-31", "10/2026", "#2026-10") or of
+// a word ("orch-2024") is none of these. A bare number from 1900 to 2099 is
+// taken for a year unless it opens the args ("/deliver 2045"). "#2026" on its
+// own still counts: it names an item. An Azure DevOps work item URL in skill
+// args gives its id, like a GitHub issue URL.
+const DATE = /^(?:(?:19|20)\d\d(?:[-/.]\d{1,2}){1,2}|(?:\d{1,2}[-/.]){1,2}(?:19|20)\d\d)$/
+
 export function workItemOf(text: string, allowBare: boolean): string | null {
-  const issue = allowBare ? text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/(\d{1,7})\b/i) : null
-  if (issue?.[1]) return issue[1]
-  const hash = text.match(/#(\d{3,7})\b/)
-  if (hash?.[1]) return hash[1]
+  const url = allowBare
+    ? text.match(/https:\/\/(?:github\.com\/[\w.-]+\/[\w.-]+\/issues|\S+\/_workitems\/edit)\/(\d{1,7})\b/i)
+    : null
+  if (url?.[1]) return url[1]
+  for (const m of text.matchAll(/#(\d{3,7}(?:[-/.]\d+)*)(?!\w)/g)) {
+    const run = m[1] ?? ''
+    if (!DATE.test(run)) return run.split(/[-/.]/)[0] ?? null
+  }
   if (!allowBare) return null
-  const bare = text.match(/\b(\d{4,7})\b/)
-  return bare?.[1] ?? null
+  const first = text.search(/\S/)
+  for (const m of text.matchAll(/(?<![\w/.-])(\d+(?:[-/.]\d+)*)(?!\w)/g)) {
+    // A list or range of items ("25229/25230") gives its first; a run with a
+    // shorter part is a version, decimal or date, never an item.
+    const run = m[1] ?? ''
+    const parts = run.split(/[-/.]/)
+    if (DATE.test(run) || parts.some((p) => p.length < 4 || p.length > 7)) continue
+    for (const [i, part] of parts.entries()) {
+      const year = part.length === 4 && Number(part) >= 1900 && Number(part) <= 2099
+      if (!year || (m.index === first && i === 0)) return part
+    }
+  }
+  return null
 }
 
 // A pull request's web URL on GitHub or Azure DevOps (both host styles).

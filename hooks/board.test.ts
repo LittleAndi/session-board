@@ -23,6 +23,34 @@ describe('summaries', () => {
     expect(workItemOf('https://github.com/o/r/issues/12 medium report-to=orch-2024 name=dlv-12', true)).toBe('12')
     expect(workItemOf('see https://github.com/o/r/issues/12', false)).toBe(null)
   })
+
+  test('years and dates are not work items', async () => {
+    expect(workItemOf('2026-10-31', true)).toBe(null)
+    expect(workItemOf('since 2026/10, see 10/2026 or 31.10.2026', true)).toBe(null)
+    expect(workItemOf('report for 2026', true)).toBe(null)
+    expect(workItemOf('name=dlv-25229', true)).toBe(null)
+    expect(workItemOf('2026-10-31 then 25229', true)).toBe('25229')
+    expect(workItemOf('deliver 25229.', true)).toBe('25229')
+    expect(workItemOf('logs from #2026-10-31', false)).toBe(null)
+    expect(workItemOf('dates #2026-10-31 and #1234', false)).toBe('1234')
+    expect(workItemOf('continue on #2026', false)).toBe('2026')
+    expect(workItemOf('since #2026/10', false)).toBe(null)
+    // A year-range number that opens the args is the item it names.
+    expect(workItemOf('2045', true)).toBe('2045')
+    expect(workItemOf('2045, use autocomplete', true)).toBe('2045')
+    // Pairs and ranges of items are not dates.
+    expect(workItemOf('25229/25230', true)).toBe('25229')
+    expect(workItemOf('25229-25231', true)).toBe('25229')
+    expect(workItemOf('#25229-25231', false)).toBe('25229')
+    expect(workItemOf('https://dev.azure.com/org/proj/_workitems/edit/25229', true)).toBe('25229')
+    expect(workItemOf('https://org.visualstudio.com/P/_workitems/edit/2026/ medium', true)).toBe('2026')
+    expect(workItemOf('see https://example.com/a/25229', true)).toBe(null)
+    expect(workItemOf('2045-2046', true)).toBe('2045')
+    expect(workItemOf('2045/2046', true)).toBe('2045')
+    expect(workItemOf('1500.50 then 25229', true)).toBe('25229')
+    expect(workItemOf('build 1.2.12345', true)).toBe(null)
+    expect(workItemOf('2026-1-12345', true)).toBe(null)
+  })
 })
 
 describe('pull requests', () => {
