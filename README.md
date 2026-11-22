@@ -249,6 +249,15 @@ reported or else a phase inferred from the running subagent, the tools in flight
 their status, and context use, cost and turn count. Click a tile for the
 prompt, the agent list, the full timeline and a `claude --resume` line to copy.
 
+A strip above the tiles shows today's totals: what every session spent since
+local midnight, ended ones included, how many sessions are active and how many
+need you. Hover the cost for the split per project. A session counts only what
+it spent today, from the cost it had when the day began. A status file written
+by an older version of the hooks has no such baseline: it counts whole if the
+session started today, and not at all otherwise. Sessions in a sandbox never
+count, since their status files can claim anything. A `+` after the cost and
+the hover text point out sessions left out.
+
 ### Desktop notifications
 
 While you work in a terminal you won't see the tab's title or favicon change.
@@ -367,8 +376,12 @@ claude plugin test .
 cd server && python -m unittest
 ```
 
-Status files of ended sessions are never deleted by the mod. The dashboard hides
-them after 24 hours; delete `~/.claude/board/sessions/*.json` whenever you like.
+The dashboard hides status files of ended sessions after 24 hours, and each
+session start deletes the ones in `sessions/` that no session has written for a
+week. Each project's newest file stays, so the queue still knows the project,
+and so does each work item's, so a plan strip still shows it done. Deleting
+goes through `powershell.exe`, so it happens on Windows only; `sandboxed/` is
+never cleaned.
 
 ## Licence
 

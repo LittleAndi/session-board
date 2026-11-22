@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { addMessage, crossSessionMessage, peerNotice, sendTarget, MAX_MESSAGES, boardStatus, progressOf, progressText, boardPlan, planWaiting, plannedWork, pruneShells, shellReported, shellToolDone, SHELL_MAX_MS, addPrs, adoOrgOf, cronFired, cronToolDone, nextCronMatch, pruneCrons, CRON_EXPIRY_MS, WAKEUP_ID, adoPrLink, adoPrLookupOf, adoPrShowArgv, adoRepoOf, cacheTtlOf, childLabel, deriveState, freshBoard, memoryOf, parseMachine, parseProbe, prLinksOf, prsOfTool, pushEvent, projectDirName, scansForPrs, sessionTitleOf, slashCommand, summarize, toolLabel, trimAgents, workItemOf, MAX_AGENTS, MAX_EVENTS, MEMORY_HISTORY, type ProcRec } from './lib'
+import { STALE_BOARD_MS, removeScript, staleBoards, costDayOf, localDay, addMessage, crossSessionMessage, peerNotice, sendTarget, MAX_MESSAGES, boardStatus, progressOf, progressText, boardPlan, planWaiting, plannedWork, pruneShells, shellReported, shellToolDone, SHELL_MAX_MS, addPrs, adoOrgOf, cronFired, cronToolDone, nextCronMatch, pruneCrons, CRON_EXPIRY_MS, WAKEUP_ID, adoPrLink, adoPrLookupOf, adoPrShowArgv, adoRepoOf, cacheTtlOf, childLabel, deriveState, freshBoard, memoryOf, parseMachine, parseProbe, prLinksOf, prsOfTool, pushEvent, projectDirName, scansForPrs, sessionTitleOf, slashCommand, summarize, toolLabel, trimAgents, workItemOf, MAX_AGENTS, MAX_EVENTS, MEMORY_HISTORY, type ProcRec } from './lib'
 
 describe('summaries', () => {
   test('a tool call becomes one short line', async () => {
@@ -703,4 +703,110 @@ test('the board never gets in the way of a message to another session', async ($
   on('session.send', () => ({ isDelivered: true }))
   const result = await $.session.send({ to: 'session-board-57', text: 'hello' })
   expect(result.isDelivered).toBe(true)
+})
+
+describe('cost per day', () => {
+  const at = (d: number, h: number, m = 0) => new Date(2026, 10, d, h, m).getTime()
+
+  test('the local day is a date string', async () => {
+    expect(localDay(at(22, 0, 5))).toBe('2026-11-22')
+    expect(localDay(at(21, 23, 59))).toBe('2026-11-21')
+  })
+
+  test('a fresh session counts from 0, one from older hooks from now', async () => {
+    expect(costDayOf(null, null, 0.4, at(22, 9), at(22, 9, 1))).toEqual({ day: '2026-11-22', usd: 0 })
+    expect(costDayOf(undefined, 3, 3.5, at(21, 9), at(22, 9))).toEqual({ day: '2026-11-22', usd: 3.5 })
+  })
+
+  test('the baseline holds through the day and moves at midnight', async () => {
+    const today = { day: '2026-11-22', usd: 2 }
+    expect(costDayOf(today, 4, 5, at(21, 9), at(22, 18))).toBe(today)
+    // The first refresh after midnight: yesterday ended where the last one left it.
+    expect(costDayOf({ day: '2026-11-21', usd: 0 }, 6, 6.2, at(21, 9), at(22, 0, 0))).toEqual({ day: '2026-11-22', usd: 6 })
+  })
+
+  test('an unknown cost keeps the baseline, a total that went down was reset', async () => {
+    const today = { day: '2026-11-22', usd: 2 }
+    expect(costDayOf(today, 4, null, at(21, 9), at(22, 18))).toBe(today)
+    expect(costDayOf(null, null, null, at(22, 9), at(22, 18))).toBe(null)
+    // $2 spent today before the reset still counts: 1 - (-2) = 3.
+    expect(costDayOf(today, 4, 1, at(21, 9), at(22, 18))).toEqual({ day: '2026-11-22', usd: -2 })
+    expect(costDayOf(today, null, 1, at(21, 9), at(22, 18))).toEqual({ day: '2026-11-22', usd: 0 })
+    // Reset across midnight: everything since counts.
+    expect(costDayOf({ day: '2026-11-21', usd: 0 }, 8, 0.5, at(21, 9), at(22, 0, 1))).toEqual({ day: '2026-11-22', usd: 0 })
+  })
+})
+
+describe('old status files', () => {
+  const now = 1_800_000_000_000
+  const at = (updatedAt: unknown) => JSON.stringify({ updatedAt })
+
+  test('only files more than a week old are deleted, never this session\'s own', async () => {
+    const files = [
+      { name: 'old.json', text: at(now - STALE_BOARD_MS - 1) },
+      { name: 'recent.json', text: at(now - STALE_BOARD_MS + 60_000) },
+      { name: 'self.json', text: at(now - STALE_BOARD_MS - 1) },
+    ]
+    expect(staleBoards(files, 'self', now)).toEqual(['old.json'])
+  })
+
+  test('each project keeps its newest file, so the queue still lists it', async () => {
+    const week = now - STALE_BOARD_MS
+    const of = (updatedAt: number, cwd: string, root?: string) => JSON.stringify({ updatedAt, cwd, repo: root ? { root } : null })
+    const files = [
+      { name: 'a-old.json', text: of(week - 9_000, 'C:\\repo\\a\\sub', 'C:\\repo\\a') },
+      { name: 'a-newer.json', text: of(week - 5_000, 'c:/Repo/A/') },
+      { name: 'b-only.json', text: of(week - 9_000, 'C:\\scratch\\b') },
+      { name: 'c-old.json', text: of(week - 9_000, 'C:\\c') },
+      { name: 'c-live.json', text: of(now - 1_000, 'C:\\c') },
+    ]
+    expect(staleBoards(files, 'self', now).sort()).toEqual(['a-old.json', 'c-old.json'])
+  })
+
+  test('each work item keeps its newest file, so a plan strip still shows it', async () => {
+    const week = now - STALE_BOARD_MS
+    const of = (updatedAt: number, workItem: string | null) => JSON.stringify({ updatedAt, cwd: 'C:\\p', workItem })
+    const files = [
+      { name: 'live.json', text: of(now - 1_000, null) },
+      { name: 'w12-old.json', text: of(week - 9_000, '12') },
+      { name: 'w12-new.json', text: of(week - 5_000, '12') },
+      { name: 'none.json', text: of(week - 9_000, null) },
+    ]
+    expect(staleBoards(files, 'self', now).sort()).toEqual(['none.json', 'w12-old.json'])
+  })
+
+  test('projects are told apart as the server does, and relative paths have none', async () => {
+    const week = now - STALE_BOARD_MS
+    const of = (updatedAt: number, cwd: string) => JSON.stringify({ updatedAt, cwd })
+    const files = [
+      { name: 'root.json', text: of(week - 9_000, 'C:\\') },
+      { name: 'rel.json', text: of(week - 5_000, 'C:') },
+      { name: 'dots-old.json', text: of(week - 9_000, 'C:\\r\\x\\..\\.\\a') },
+      { name: 'dots-new.json', text: of(week - 5_000, 'c://r//a') },
+    ]
+    expect(staleBoards(files, 'self', now).sort()).toEqual(['dots-old.json', 'rel.json'])
+  })
+
+  test('unreadable, unparsable and foreign files are left alone', async () => {
+    const old = at(now - STALE_BOARD_MS - 1)
+    const files = [
+      { name: 'unread.json', text: null },
+      { name: 'torn.json', text: '{"updatedAt": 1' },
+      { name: 'no-date.json', text: '{}' },
+      { name: 'string-date.json', text: at('2020-01-01') },
+      { name: 'null.json', text: 'null' },
+      { name: 'notes.txt', text: old },
+      { name: "a'b.json", text: old },
+      { name: 'x;rm.json', text: old },
+    ]
+    expect(staleBoards(files, 'self', now)).toEqual([])
+  })
+
+  test('the delete command quotes every path and checks the age again', async () => {
+    const curly = String.fromCodePoint(0x2019)
+    const script = removeScript(['C:/b/sessions/a.json', "C:/O'Neil/s/b.json", `C:/x${curly}y/c.json`])
+    expect(script.startsWith(`Get-Item -LiteralPath 'C:/b/sessions/a.json','C:/O''Neil/s/b.json','C:/x${curly}${curly}y/c.json' `)).toBe(true)
+    expect(script).toContain(`LastWriteTime -lt (Get-Date).AddMilliseconds(-${STALE_BOARD_MS})`)
+    expect(script.endsWith('; exit 0')).toBe(true)
+  })
 })

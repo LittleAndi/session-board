@@ -91,6 +91,9 @@ export type Board = {
   events: BoardEvent[]
   context: { percent: number | null; tokens: number | null; window: number } | null
   costUsd: number | null
+  // costUsd as it stood when this local day began for the session, so the page
+  // can count what the session spent today. Set by costDayOf.
+  costDay?: CostDay | null
   // When the main thread last sent a request that used the prompt cache, and
   // the cache's TTL as the transcript's last cache write shows it (null: not known yet).
   cache?: { at: number; ttl: CacheTtl | null } | null
@@ -114,6 +117,34 @@ export type Board = {
   // place of the phase inferred from subagents. Cleared by done, a new slash
   // command and /clear.
   progress?: Progress | null
+}
+
+// A session's cost at the start of a local day: `day` is YYYY-MM-DD in this
+// PC's time zone, `usd` the running total costUsd then.
+export type CostDay = { day: string; usd: number }
+
+export function localDay(t: number): string {
+  const d = new Date(t)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// The day baseline after a cost refresh. `before` is costUsd as the last refresh
+// left it, `usd` the new value. On a new day the baseline is where the session
+// stood at its last refresh, at most 30 s before midnight. A session with no
+// baseline yet starts from 0 if it started today (a fresh session), otherwise
+// (a file from before costDay existed) from now. A total that went down was
+// reset: on the same day the baseline goes below 0 by what was already spent
+// today, so that spend still counts; on a new day it counts from 0.
+export function costDayOf(prev: CostDay | null | undefined, before: number | null, usd: number | null, startedAt: number, now: number): CostDay | null {
+  if (usd === null) return prev ?? null
+  const day = localDay(now)
+  const reset = before !== null && usd < before
+  if (prev && prev.day === day) {
+    if (reset) return { day, usd: prev.usd - before }
+    return usd < prev.usd ? { day, usd: 0 } : prev
+  }
+  if (!prev) return { day, usd: localDay(startedAt) === day ? 0 : usd }
+  return { day, usd: reset ? 0 : Math.min(before ?? usd, usd) }
 }
 
 // What a board_status call reported, cleaned by progressOf. Each report
@@ -1213,4 +1244,68 @@ export function freshBoard(sessionId: string, cwd: string, now: number): Board {
     messages: [],
     done: null,
   }
+}
+
+// Status files of sessions that ended long ago: the page hides them after a
+// day, but the folder and the listing it fetches on every poll keep growing.
+export const STALE_BOARD_MS = 7 * 24 * 3600_000
+// The names the hooks write: a session id and .json. Anything else in the
+// folder isn't the mod's, and such a name can't carry shell syntax either.
+export const isBoardFileName = (name: string) => /^[A-Za-z0-9_-]+\.json$/.test(name)
+
+// The status files to delete: last written more than a week ago, never this
+// session's own, and never one that can't be read or has no updatedAt (it may
+// be caught mid-write, or not be a status file at all). The newest file of
+// each project stays too: the server's project list (`known_projects`, the
+// queue form and **+**) comes from these files alone, keyed the same way, by
+// the repo's root or else the cwd. So does the newest of each work item, which
+// a plan strip reads an item's state from.
+export function staleBoards(files: { name: string; text: string | null }[], self: string, now: number): string[] {
+  const read: { name: string; at: number; project: string | null; workItem: string | null }[] = []
+  for (const f of files) {
+    if (!isBoardFileName(f.name) || f.name === `${self}.json` || f.text === null) continue
+    let b: { updatedAt?: unknown; cwd?: unknown; repo?: { root?: unknown } | null; workItem?: unknown } | null
+    try {
+      b = JSON.parse(f.text) as typeof b
+    } catch {
+      continue
+    }
+    if (!b || typeof b.updatedAt !== 'number') continue
+    const path = typeof b.repo?.root === 'string' && b.repo.root ? b.repo.root : b.cwd
+    const workItem = typeof b.workItem === 'string' && b.workItem ? b.workItem : null
+    read.push({ name: f.name, at: b.updatedAt, project: typeof path === 'string' ? projectKey(path) : null, workItem })
+  }
+  const newest = new Map<string, string>()
+  for (const r of [...read].sort((a, b) => a.at - b.at)) {
+    if (r.project) newest.set(`p:${r.project}`, r.name)
+    if (r.workItem) newest.set(`w:${r.workItem}`, r.name)
+  }
+  const kept = new Set(newest.values())
+  return read.filter((r) => now - r.at > STALE_BOARD_MS && !kept.has(r.name)).map((r) => r.name)
+}
+
+// A folder as `known_projects` in serve.py tells them apart on Windows
+// (normcase of normpath): case, slash direction, doubled slashes and . or ..
+// steps don't count. A relative path, which it skips, has no key.
+function projectKey(path: string): string | null {
+  const m = /^([A-Za-z]:)?[\\/]/.exec(path)
+  if (!m) return null
+  const parts: string[] = []
+  for (const part of path.slice(m[0].length).split(/[\\/]+/)) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  return `${m[1] ?? ''}/${parts.join('/')}`.toLowerCase()
+}
+
+// A PowerShell command that deletes these files. It checks each file's age
+// again first, since a session resumed after the files were read writes its
+// own file afresh. It is quiet about files that are gone already (another
+// session starting at the same time) and exits 0 once it ran. PowerShell reads
+// the curly single quotes as quotes too, so each is doubled like '.
+export function removeScript(paths: string[]): string {
+  const quoted = paths.map((p) => `'${p.replace(/['\u{2018}\u{2019}\u{201A}\u{201B}]/gu, (q) => q + q)}'`).join(',')
+  return `Get-Item -LiteralPath ${quoted} -ErrorAction SilentlyContinue | ` +
+    `Where-Object { $_.LastWriteTime -lt (Get-Date).AddMilliseconds(-${STALE_BOARD_MS}) } | ` +
+    `Remove-Item -Force -ErrorAction SilentlyContinue; exit 0`
 }

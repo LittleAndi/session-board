@@ -8,7 +8,12 @@ install it and how to serve the page. This file is for working on it.
 - `hooks/register.ts`: the hooks. Every session writes
   `%USERPROFILE%\.claude\board\sessions\<session-id>.json` on each change and a
   heartbeat every 5 s. On session start it copies `dashboard/index.html` to
-  `.claude\board\index.html`.
+  `.claude\board\index.html`, and deletes status files in `sessions/` whose
+  `updatedAt` is over a week old (`staleBoards` in `lib.ts`), except each
+  project's newest (`known_projects` needs it) and each work item's (a plan
+  strip reads it). It deletes through `powershell.exe`, since `$.fs` has no
+  delete, rechecking each file's age first, with no fallback, so a sandbox's
+  mount of `sandboxed/` is left alone.
   Once a minute it runs `PROBE` in `powershell.exe` to sample memory: the
   nearest `claude.exe` above the probe is the session's, found once per load.
   The probe also reads the PC's RAM and commit charge into `machine`; the page
@@ -31,7 +36,14 @@ install it and how to serve the page. This file is for working on it.
 - `dashboard/index.html`: one self-contained page. It lists `sessions/` through
   the directory index that `python -m http.server` serves, polls every 2 s, and
   keys tiles by session id, and group sections (project or work item) by
-  group, so CSS animations survive polls. View choices live in `localStorage`. It shows the
+  group, so CSS animations survive polls. View choices live in `localStorage`.
+  The strip above the tiles (`renderToday`) sums today's cost: `costUsd` is a
+  running total, so each session counts `costUsd - costDay.usd` when `costDay`
+  (set by `costDayOf` in `lib.ts` at the first cost refresh of each local day)
+  is today's; a file without `costDay` counts whole only if it started today.
+  Sandboxed files never count. A board made fresh after `/clear` or a resume
+  keeps the ended board's `costUsd` and `costDay`, and a total that drops
+  counts as a reset. It shows the
   **queue** form and list only when `GET api/queue` answers, so it still works
   under `python -m http.server`. It also lists `sandboxed/`, status files that
   sessions in a sandbox write through a mount. Those are untrusted: `defang()`
@@ -199,6 +211,10 @@ SESSION_BOARD_DIR=<scratch dir> claude -p --plugin-dir . --model haiku "<prompt 
 
 ## Not verified yet
 
+- Whether a resumed session's `costUsd` restarts at 0 or carries the earlier
+  cost. `costDayOf` handles either, as long as the ended status file is there.
+  That needs `/clear` and a resume to keep the session id; with a new id the
+  old and new files would both count the carried cost.
 - An actual start from the queue: the Windows Terminal tab, that
   `--session-id` gives the status file the name the queue waits for, and that
   a delivery run calls `board_status` at its end without being told to.

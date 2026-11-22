@@ -16,10 +16,15 @@ import {
   adoPrLink,
   adoPrShowArgv,
   cacheTtlOf,
+  costDayOf,
+  localDay,
   agentStatusOf,
   boardPlan,
   boardStatus,
   progressText,
+  isBoardFileName,
+  removeScript,
+  staleBoards,
   clip,
   cronFired,
   cronToolDone,
@@ -233,7 +238,10 @@ async function refreshSlow($: EngineInterface) {
       tokens: usage.context.tokens ?? null,
       window: usage.context.window,
     }
-    board.costUsd = usage.cost?.usd ?? null
+    // A refresh without a cost keeps the last one, so the next can tell a reset.
+    const usd = usage.cost?.usd ?? null
+    board.costDay = costDayOf(board.costDay, board.costUsd, usd, board.startedAt, now())
+    if (usd !== null) board.costUsd = usd
   } catch {}
   try {
     const git = await $.process.run(['git', 'branch', '--show-current'], { cwd: board.cwd, timeoutMs: 5_000 })
@@ -309,6 +317,35 @@ async function tick($: EngineInterface) {
   await flush($)
 }
 
+const REMOVE_BATCH = 100 // paths per delete command, well inside Windows' command-line limit
+
+// Deletes status files no session has written for a week. sandboxed/ is left
+// alone: the mod doesn't own it, and a session inside a (Linux) sandbox has no
+// powershell.exe to delete its mount of it with.
+async function pruneOldBoards($: EngineInterface, dir: string, self: string) {
+  try {
+    const files: { name: string; text: string | null }[] = []
+    for (const f of await $.fs.list(`${dir}/sessions`)) {
+      if (f.kind === 'dir' || !isBoardFileName(f.name)) continue
+      let text: string | null = null
+      try {
+        text = await $.fs.read(`${dir}/sessions/${f.name}`)
+      } catch {}
+      files.push({ name: f.name, text })
+    }
+    const paths = staleBoards(files, self, now()).map((name) => `${dir}/sessions/${name}`)
+    for (let i = 0; i < paths.length; i += REMOVE_BATCH) await removeFiles($, paths.slice(i, i + REMOVE_BATCH))
+  } catch {}
+}
+
+// $.fs has no delete. Only PowerShell: its command checks each file's age
+// again right before deleting it, and where it can't run nothing is deleted.
+async function removeFiles($: EngineInterface, paths: string[]) {
+  try {
+    await $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', removeScript(paths)], { timeoutMs: 20_000 })
+  } catch {}
+}
+
 // The served dashboard always matches the one this plugin ships.
 async function copyDashboard($: EngineInterface, dir: string) {
   try {
@@ -331,6 +368,16 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
   } catch {}
 
   board = previous && previous.state !== 'ended' ? previous : freshBoard(id, cwd, now())
+  // After /clear (or a resume) the process's cost can carry on from the ended
+  // board, so its day baseline carries on too, or today would count it all.
+  if (previous && board !== previous) {
+    board.costUsd = previous.costUsd ?? null
+    // A file from older hooks has no baseline: what it had counts as spent
+    // today only if it started today.
+    board.costDay = previous.costDay ?? (typeof previous.costUsd === 'number'
+      ? { day: localDay(now()), usd: localDay(previous.startedAt) === localDay(now()) ? 0 : previous.costUsd }
+      : null)
+  }
   board.cwd = cwd
   board.interactive = interactive
   board.tools = []
@@ -369,6 +416,7 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
     planTool = (await $.tool.register({ ...BOARD_PLAN_TOOL, isDeferred: true })).tool
   } catch {}
   await copyDashboard($, dir)
+  void pruneOldBoards($, dir, id)
   await refreshSlow($)
   await readTranscript($)
   await flush($)
