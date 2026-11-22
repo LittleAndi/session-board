@@ -1245,3 +1245,67 @@ export function freshBoard(sessionId: string, cwd: string, now: number): Board {
     done: null,
   }
 }
+
+// Status files of sessions that ended long ago: the page hides them after a
+// day, but the folder and the listing it fetches on every poll keep growing.
+export const STALE_BOARD_MS = 7 * 24 * 3600_000
+// The names the hooks write: a session id and .json. Anything else in the
+// folder isn't the mod's, and such a name can't carry shell syntax either.
+export const isBoardFileName = (name: string) => /^[A-Za-z0-9_-]+\.json$/.test(name)
+
+// The status files to delete: last written more than a week ago, never this
+// session's own, and never one that can't be read or has no updatedAt (it may
+// be caught mid-write, or not be a status file at all). The newest file of
+// each project stays too: the server's project list (`known_projects`, the
+// queue form and **+**) comes from these files alone, keyed the same way, by
+// the repo's root or else the cwd. So does the newest of each work item, which
+// a plan strip reads an item's state from.
+export function staleBoards(files: { name: string; text: string | null }[], self: string, now: number): string[] {
+  const read: { name: string; at: number; project: string | null; workItem: string | null }[] = []
+  for (const f of files) {
+    if (!isBoardFileName(f.name) || f.name === `${self}.json` || f.text === null) continue
+    let b: { updatedAt?: unknown; cwd?: unknown; repo?: { root?: unknown } | null; workItem?: unknown } | null
+    try {
+      b = JSON.parse(f.text) as typeof b
+    } catch {
+      continue
+    }
+    if (!b || typeof b.updatedAt !== 'number') continue
+    const path = typeof b.repo?.root === 'string' && b.repo.root ? b.repo.root : b.cwd
+    const workItem = typeof b.workItem === 'string' && b.workItem ? b.workItem : null
+    read.push({ name: f.name, at: b.updatedAt, project: typeof path === 'string' ? projectKey(path) : null, workItem })
+  }
+  const newest = new Map<string, string>()
+  for (const r of [...read].sort((a, b) => a.at - b.at)) {
+    if (r.project) newest.set(`p:${r.project}`, r.name)
+    if (r.workItem) newest.set(`w:${r.workItem}`, r.name)
+  }
+  const kept = new Set(newest.values())
+  return read.filter((r) => now - r.at > STALE_BOARD_MS && !kept.has(r.name)).map((r) => r.name)
+}
+
+// A folder as `known_projects` in serve.py tells them apart on Windows
+// (normcase of normpath): case, slash direction, doubled slashes and . or ..
+// steps don't count. A relative path, which it skips, has no key.
+function projectKey(path: string): string | null {
+  const m = /^([A-Za-z]:)?[\\/]/.exec(path)
+  if (!m) return null
+  const parts: string[] = []
+  for (const part of path.slice(m[0].length).split(/[\\/]+/)) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  return `${m[1] ?? ''}/${parts.join('/')}`.toLowerCase()
+}
+
+// A PowerShell command that deletes these files. It checks each file's age
+// again first, since a session resumed after the files were read writes its
+// own file afresh. It is quiet about files that are gone already (another
+// session starting at the same time) and exits 0 once it ran. PowerShell reads
+// the curly single quotes as quotes too, so each is doubled like '.
+export function removeScript(paths: string[]): string {
+  const quoted = paths.map((p) => `'${p.replace(/['\u{2018}\u{2019}\u{201A}\u{201B}]/gu, (q) => q + q)}'`).join(',')
+  return `Get-Item -LiteralPath ${quoted} -ErrorAction SilentlyContinue | ` +
+    `Where-Object { $_.LastWriteTime -lt (Get-Date).AddMilliseconds(-${STALE_BOARD_MS}) } | ` +
+    `Remove-Item -Force -ErrorAction SilentlyContinue; exit 0`
+}

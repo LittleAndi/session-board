@@ -8,7 +8,12 @@ install it and how to serve the page. This file is for working on it.
 - `hooks/register.ts`: the hooks. Every session writes
   `%USERPROFILE%\.claude\board\sessions\<session-id>.json` on each change and a
   heartbeat every 5 s. On session start it copies `dashboard/index.html` to
-  `.claude\board\index.html`.
+  `.claude\board\index.html`, and deletes status files in `sessions/` whose
+  `updatedAt` is over a week old (`staleBoards` in `lib.ts`), except each
+  project's newest (`known_projects` needs it) and each work item's (a plan
+  strip reads it). It deletes through `powershell.exe`, since `$.fs` has no
+  delete, rechecking each file's age first, with no fallback, so a sandbox's
+  mount of `sandboxed/` is left alone.
   Once a minute it runs `PROBE` in `powershell.exe` to sample memory: the
   nearest `claude.exe` above the probe is the session's, found once per load.
   The probe also reads the PC's RAM and commit charge into `machine`; the page

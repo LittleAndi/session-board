@@ -376,8 +376,12 @@ claude plugin test .
 cd server && python -m unittest
 ```
 
-Status files of ended sessions are never deleted by the mod. The dashboard hides
-them after 24 hours; delete `~/.claude/board/sessions/*.json` whenever you like.
+The dashboard hides status files of ended sessions after 24 hours, and each
+session start deletes the ones in `sessions/` that no session has written for a
+week. Each project's newest file stays, so the queue still knows the project,
+and so does each work item's, so a plan strip still shows it done. Deleting
+goes through `powershell.exe`, so it happens on Windows only; `sandboxed/` is
+never cleaned.
 
 ## Licence
 
