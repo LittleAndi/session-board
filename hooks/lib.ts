@@ -117,6 +117,10 @@ export type Board = {
   // place of the phase inferred from subagents. Cleared by done, a new slash
   // command and /clear.
   progress?: Progress | null
+  // When the main thread's model last streamed: each chunk of a model request
+  // (turn.step) moves it on, and the heartbeat writes it. The page counts it as
+  // activity, so a long streamed answer doesn't look like a hung session.
+  lastStepAt?: number | null
 }
 
 // A session's cost at the start of a local day: `day` is YYYY-MM-DD in this
@@ -145,6 +149,42 @@ export function costDayOf(prev: CostDay | null | undefined, before: number | nul
   }
   if (!prev) return { day, usd: localDay(startedAt) === day ? 0 : usd }
   return { day, usd: reset ? 0 : Math.min(before ?? usd, usd) }
+}
+
+// Notes that the model streamed at `t`. A subagent's steps don't count: a
+// background agent streaming says nothing about whether the main loop hangs.
+export function stepSeen(b: Board, agentId: string | undefined, t: number): void {
+  if (agentId || t <= (b.lastStepAt ?? 0)) return
+  b.lastStepAt = t
+}
+
+// Forwards a model stream, calling `seen` as each chunk arrives. Values sent
+// in and errors thrown in reach the source, and closing early closes it, but
+// unlike yield* the source's return value on an early close is dropped, and a
+// thenable chunk would be awaited (model chunks are plain objects). A failing
+// `seen` never stops the stream.
+export async function* streamed<T, R>(source: AsyncGenerator<T, R, unknown>, seen: () => void): AsyncGenerator<T, R, unknown> {
+  let finished = false
+  try {
+    let r = await source.next()
+    while (!r.done) {
+      try {
+        seen()
+      } catch {}
+      let sent: unknown
+      try {
+        sent = yield r.value
+      } catch (err) {
+        r = await source.throw(err)
+        continue
+      }
+      r = await source.next(sent)
+    }
+    finished = true
+    return r.value
+  } finally {
+    if (!finished) await source.return(undefined as R)
+  }
 }
 
 // What a board_status call reported, cleaned by progressOf. Each report

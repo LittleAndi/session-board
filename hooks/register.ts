@@ -13,6 +13,8 @@ import {
   QUIET_TOOLS,
   addMessage,
   addPrs,
+  stepSeen,
+  streamed,
   adoPrLink,
   adoPrShowArgv,
   cacheTtlOf,
@@ -720,9 +722,14 @@ export const register: Register = (on) => {
   })
 
   // A model request; it streams, so the hook forwards the chunks as they come.
+  // The main thread's chunks also move lastStepAt on, which the heartbeat writes.
   on('turn.step', async function* ($, e, next) {
     const sent = now()
-    const result = yield* next(e)
+    const seen = () => {
+      if (board) stepSeen(board, e.agentId, now())
+    }
+    seen()
+    const result = yield* (e.agentId ? next(e) : streamed(next(e), seen))
     try {
       if (!e.agentId && result.usage) cacheUsed($, sent, result.usage)
     } catch {}
