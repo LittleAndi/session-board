@@ -74,6 +74,40 @@ class CheckLaunch(unittest.TestCase):
             check_launch(["1"], self.projects)
 
 
+class LogToFile(unittest.TestCase):
+    def test_only_without_a_console(self):
+        import sys
+        from serve import log_to_file
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(log_to_file(Path(d)))
+            out, err = sys.stdout, sys.stderr
+            try:
+                sys.stdout = sys.stderr = None  # as under pythonw.exe
+                self.assertTrue(log_to_file(Path(d)))
+                print("hello", file=sys.stderr)
+                sys.stderr.close()
+            finally:
+                sys.stdout, sys.stderr = out, err
+            self.assertEqual((Path(d) / "server.log").read_text(encoding="utf-8").strip(), "hello")
+
+    def test_log_is_capped(self):
+        from serve import CappedLog
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "server.log"
+            log = CappedLog(path, max_bytes=1000)
+            try:
+                for i in range(500):
+                    print(f"line {i:04}", file=log)
+            finally:
+                log.close()
+            old = path.with_suffix(".log.1")
+            self.assertLess(path.stat().st_size, 1000)
+            self.assertLess(old.stat().st_size, 1100)
+            kept = old.read_text(encoding="utf-8") + path.read_text(encoding="utf-8")
+            self.assertTrue(kept.endswith("line 0499\n"))
+            self.assertNotIn("line 0000", kept)
+
+
 class SameOrigin(unittest.TestCase):
     ok = {"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765", "Content-Type": "application/json"}
 

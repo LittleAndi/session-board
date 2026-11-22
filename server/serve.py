@@ -492,6 +492,11 @@ class Handler(SimpleHTTPRequestHandler):
     board: Path
     port: int
     queue: Queue
+    log_ok: bool = True  # log requests that succeeded, not only errors and queue actions
+
+    def log_request(self, code="-", size="-"):
+        if self.log_ok or not isinstance(code, int) or code >= 400:
+            super().log_request(code, size)
 
     def send_json(self, status: int, data) -> None:
         body = json.dumps(data).encode()
@@ -541,6 +546,64 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(200, item)
 
 
+LOG_MAX = 1_000_000  # bytes; server.log plus server.log.1 never pass twice this
+
+
+class CappedLog:
+    """A line-buffered text log that moves itself to <name>.1 when it reaches
+    max_bytes, so only the newest 2 x max_bytes or so are kept. If the move
+    fails (server.log.1 open in another program), it starts the log over."""
+
+    def __init__(self, path: Path, max_bytes: int = LOG_MAX):
+        self.path, self.max_bytes = path, max_bytes
+        self.lock = threading.Lock()
+        try:
+            self.size = path.stat().st_size
+        except OSError:
+            self.size = 0
+        self.file = open(path, "a", encoding="utf-8", newline="\n", buffering=1)
+        if self.size >= max_bytes:
+            self.rotate()
+
+    def rotate(self) -> None:
+        self.file.close()
+        try:
+            os.replace(self.path, self.path.with_suffix(".log.1"))
+            mode = "a"
+        except OSError:
+            mode = "w"
+        self.file = open(self.path, mode, encoding="utf-8", newline="\n", buffering=1)
+        self.size = 0
+
+    def write(self, s: str) -> int:
+        with self.lock:
+            n = self.file.write(s)
+            self.size += len(s.encode("utf-8", "replace"))
+            if self.size >= self.max_bytes:
+                self.rotate()
+        return n
+
+    def flush(self) -> None:
+        with self.lock:
+            self.file.flush()
+
+    def close(self) -> None:
+        with self.lock:
+            self.file.close()
+
+
+def log_to_file(board: Path) -> bool:
+    """Under pythonw.exe there is no console and sys.stderr is None, so
+    http.server's request log would raise; log to <board>/server.log instead,
+    capped by CappedLog. Returns whether it did."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return False
+    log = CappedLog(board / "server.log")
+    sys.stdout = sys.stdout or log
+    sys.stderr = sys.stderr or log
+    return True
+
+
 def run_queue(queue: Queue) -> None:
     while True:
         try:
@@ -567,9 +630,11 @@ def main() -> None:
         sys.exit("--prompt must contain {id}")
     board = args.dir.resolve()
     board.mkdir(parents=True, exist_ok=True)
+    to_file = log_to_file(board)
     queue = Queue(board, args.prompt, int(args.idle_minutes * 60_000), args.max_sessions,
                   start=partial(launch, wt_profile=args.wt_profile))
-    handler = type("BoardHandler", (Handler,), {"board": board, "port": args.port, "queue": queue})
+    handler = type("BoardHandler", (Handler,), {"board": board, "port": args.port, "queue": queue,
+                                             "log_ok": not to_file})
     try:
         server = Server(("127.0.0.1", args.port), partial(handler, directory=str(board)))
     except OSError as e:
