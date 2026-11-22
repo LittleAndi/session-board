@@ -52,6 +52,9 @@ import {
   shellReported,
   shellToolDone,
   skillWorkItem,
+  skillRulesOf,
+  DEFAULT_SKILL_RULES,
+  type SkillRules,
   slashCommand,
   housekeepingCommand,
   summarize,
@@ -351,6 +354,28 @@ async function removeFiles($: EngineInterface, paths: string[]) {
   } catch {}
 }
 
+// skills.json in the board folder, read at each load before the board is
+// ready, so a session's first prompt already gets its rules. A missing file
+// leaves the default skill rules, and so does a broken one, which the answer
+// names for the board's events.
+let skillRules: SkillRules = DEFAULT_SKILL_RULES
+
+async function loadSkillRules($: EngineInterface, dir: string): Promise<string | null> {
+  const path = `${dir}/skills.json`
+  try {
+    if (!(await $.fs.exists(path))) {
+      skillRules = DEFAULT_SKILL_RULES
+      return null
+    }
+    // Windows PowerShell and Notepad can save it with a byte-order mark.
+    skillRules = skillRulesOf(JSON.parse((await $.fs.read(path)).replace(/^\u{FEFF}/u, '')))
+    return null
+  } catch (e) {
+    skillRules = DEFAULT_SKILL_RULES
+    return `skills.json unreadable, default skill rules apply: ${clip(String(e), 120)}`
+  }
+}
+
 // The served dashboard always matches the one this plugin ships.
 async function copyDashboard($: EngineInterface, dir: string) {
   try {
@@ -365,6 +390,7 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
   const dir = await boardDir($)
   const id = await $.session.id()
   file = `${dir}/sessions/${id}.json`
+  const skillsNote = await loadSkillRules($, dir)
 
   // A reload of this module mid-session keeps what the file already says.
   let previous: Board | null = null
@@ -408,6 +434,7 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
     board.repo = repo ? { name: repo.name, root: repo.root, remote: repo.remote } : null
   } catch {}
   event('session', previous && previous.state !== 'ended' ? 'board reloaded' : reason)
+  if (skillsNote) event('session', skillsNote)
 
   try {
     boardTool = (await $.tool.register({ ...BOARD_STATUS_TOOL, isDeferred: false })).tool
@@ -504,7 +531,7 @@ function setSkill(name: string, args: string) {
     // The work item comes from the whole args; only the stored copy is clipped.
     board.skill = { name, args: clip(args, 200), at: now() }
     skillSetThisTurn = true
-    board.workItem = skillWorkItem(name, args) ?? board.workItem
+    board.workItem = skillWorkItem(name, args, skillRules) ?? board.workItem
   }
   event('skill', `${name} ${args}`)
 }
