@@ -16,6 +16,10 @@ describe('summaries', () => {
     expect(slashCommand('<command-message>log-check</command-message>\n<command-name>/log-check</command-name>\n<command-args>yesterday</command-args>'))
       .toEqual({ name: 'log-check', args: 'yesterday' })
     expect(slashCommand('<command-message>log-check</command-message> is running…')).toEqual({ name: 'log-check', args: '' })
+    // Long args come back whole, so a work item past 200 characters is still read.
+    const long = `10m /work-item-delivery ${'check the nightly export and list what is missing, '.repeat(5)}then 25229`
+    expect(slashCommand(`/loop ${long}`)?.args).toBe(long)
+    expect(slashCommand(`<command-name>/loop</command-name>\n<command-args>${long}</command-args>`)?.args).toBe(long)
     for (const name of ['reload-plugins', 'rename', '/model', 'Compact'])
       expect(housekeepingCommand(name)).toBe(true)
     for (const name of ['clear', 'resume', 'rewind', 'status', 'export', 'gh-issue-delivery', 'code-review', 'loop', 'init', ''])
@@ -384,6 +388,49 @@ test('a housekeeping command keeps the skill and its progress report', async ($,
   await $.tool.call({ tool: 'Skill', skill: 'status', args: '' })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't5', reason: 'answer' })
   expect((await status()).activeSkill).toBe('status')
+})
+
+test('a long command keeps its work item and stores clipped args', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  mock.env(on, { SESSION_BOARD_DIR: '/board' })
+  const files = new Map<string, string>()
+  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  const status = async () => {
+    await clock.advance(1_000)
+    const [, text] = [...files].find(([path]) => /[\\/]sessions[\\/]s1\.json$/.test(path)) ?? []
+    return JSON.parse(text ?? '{}')
+  }
+
+  const args = `10m /work-item-delivery ${'check the nightly export and list what is missing, '.repeat(5)}then 25229`
+  expect(args.length).toBeGreaterThan(200)
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  await $.turn.start({ text: `<command-message>loop</command-message>\n<command-name>/loop</command-name>\n<command-args>${args}</command-args>`, turnId: 't1' })
+  const board = await status()
+  expect(board.workItem).toBe('25229')
+  expect(board.skill?.name).toBe('loop')
+  expect(board.skill?.args.length).toBe(200)
+  expect(board.skill?.args.endsWith('…')).toBe(true)
+
+  // Args the model passes to the Skill tool are stored clipped too, and the
+  // work item is still read from them whole, not from the clipped copy.
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.start({ text: 'deliver the next one', turnId: 't2' })
+  await $.tool.call({ tool: 'Skill', skill: 'work-item-delivery', args: `${'use low review and keep the diff small, '.repeat(6)}then 25230` })
+  const next = await status()
+  expect(next.workItem).toBe('25230')
+  expect(next.skill?.name).toBe('work-item-delivery')
+  expect(next.skill?.args.length).toBe(200)
 })
 
 describe('prompt cache', () => {
