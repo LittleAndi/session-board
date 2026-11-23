@@ -123,6 +123,35 @@ describe('summaries', () => {
     expect(skillWorkItem('order-delivery', '1234', skillRulesOf({ workItem: ['^(deliver-issue$'] }))).toBe(null)
   })
 
+  test('skills.json says what it ignored', async () => {
+    const ignoredOf = (json: unknown) => {
+      const ignored: string[] = []
+      skillRulesOf(json, ignored)
+      return ignored
+    }
+    expect(ignoredOf({})).toEqual([])
+    expect(ignoredOf({ workItem: ['^deliver-issue$'], pr: [], wrapper: ['^every$'] })).toEqual([])
+    for (const json of [null, 'x', 42, []]) expect(ignoredOf(json)).toEqual(['not a JSON object, so every default applies'])
+    // A misspelled key keeps the defaults, and says so.
+    expect(ignoredOf({ workitem: ['^deliver-issue$'], PR: [] })).toEqual(['unknown key "workitem" ignored', 'unknown key "PR" ignored'])
+    expect(skillRulesOf({ workitem: ['^deliver-issue$'] })).toEqual(DEFAULT_SKILL_RULES)
+    expect(ignoredOf({ workItem: 'deliver$' })).toEqual(['"workItem" is not a list of strings, so its default applies'])
+    expect(ignoredOf({ pr: [1], wrapper: null })).toEqual([
+      '"pr" is not a list of strings, so its default applies',
+      '"wrapper" is not a list of strings, so its default applies',
+    ])
+    expect(ignoredOf({ workItem: ['(', '^deliver-issue$', '[a'] })).toEqual([
+      '"workItem" pattern "(" doesn\'t compile, skipped',
+      '"workItem" pattern "[a" doesn\'t compile, skipped',
+    ])
+    // A long pattern is cut, so the reasons after it still fit in the event.
+    for (const json of [{ pr: ['(' + 'x'.repeat(200)] }, { pr: ['(' + '\\d'.repeat(100)] }, { ['k'.repeat(300)]: [] }]) {
+      const [long] = ignoredOf(json)
+      expect(long!.length).toBeLessThan(90)
+    }
+    expect(ignoredOf({ 'a"b': [] })).toEqual(['unknown key "a\\"b" ignored'])
+  })
+
   test('years and dates are not work items', async () => {
     expect(workItemOf('2026-10-31', true)).toBe(null)
     expect(workItemOf('since 2026/10, see 10/2026 or 31.10.2026', true)).toBe(null)
