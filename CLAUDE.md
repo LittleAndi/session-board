@@ -41,9 +41,11 @@ install it and how to serve the page. This file is for working on it.
   running total, so each session counts `costUsd - costDay.usd` when `costDay`
   (set by `costDayOf` in `lib.ts` at the first cost refresh of each local day)
   is today's; a file without `costDay` counts whole only if it started today.
-  Sandboxed files never count. A board made fresh after `/clear` or a resume
-  keeps the ended board's `costUsd` and `costDay`, and a total that drops
-  counts as a reset. It shows the
+  Sandboxed files never count. `claude --resume` keeps the session id, and
+  its cost carries on from where the ended session left it, so a board made
+  fresh over the ended file keeps its `costUsd` and `costDay` and each spend
+  counts once. A total that drops counts as a reset. `/clear` never takes that
+  path: it gives the session a new id and its cost starts again near 0. It shows the
   **queue** form and list only when `GET api/queue` answers, so it still works
   under `python -m http.server`. It also lists `sandboxed/`, status files that
   sessions in a sandbox write through a mount. Those are untrusted: `defang()`
@@ -54,17 +56,34 @@ install it and how to serve the page. This file is for working on it.
   `waiting.since`, which a plan gate keeps through short turns), never for one
   there at the first poll, and, when **long turns** is on, for a turn
   (`noteTurn`, one value of `turns`) that worked 3 min or more: running and
-  background count, a wait for you doesn't. Sandboxed files never notify.
+  background count, a wait for you doesn't. When **stalls** is on, it also
+  notifies for a stall it saw begin (`stallWas`, from the render's `stalls`),
+  once per stall and never for one there at the first sight of the session,
+  nor for a quiet stall counted from that sight (`blind` in `seen`), which may
+  have begun before the page loaded.
+  Sandboxed files never notify.
   Permission is asked from the header's **turn on**, and only in a secure context.
   A session's `plan` draws as a strip above the tiles of its group (`planOf`
   checks its shape, `planHtml` draws it). Each item's state comes from the
   newest session reporting that work item, one outside a sandbox first.
-  A session's work item is `workItemOf` its skill args or prompt: `#1234`, a
+  A session's work item is `workItemOf` its skill args or prompt: `#1234`
+  (or Azure Boards' `AB#1234` or GitHub's `owner/repo#1234`, but not a `#` in
+  a URL or glued to another word; a path like `docs/spec#12` reads as
+  owner/repo), a
   GitHub issue URL in skill args (so `/deliver https://github.com/o/r/issues/12`
   is `12`), an Azure DevOps `_workitems/edit/<id>` URL or a bare 4–7 digit
-  number in skill args. A number inside a date or a word (`2026-10-31`,
+  number in skill args. Only a delivery or orchestrate skill
+  (`skillTakesWorkItem`, by name) reads a URL or bare number from its args,
+  a `#1234` counts for any skill but a PR-taking one (`/code-review #1234`
+  names no work item), and `/loop 5m /deliver 1234` gives its inner
+  command's (`skillWorkItem`). Those three name lists are
+  `DEFAULT_SKILL_RULES` in `lib.ts`; `skills.json` in the board folder,
+  read at each load, replaces any of them (`skillRulesOf`); a session event
+  names what it ignored (an unknown key, a list that isn't strings, a
+  pattern that doesn't compile). A number inside a date or a word (`2026-10-31`,
   `orch-2024`) never counts, nor a bare 1900–2099 (a year) unless it opens
-  the args. Plan items name work items by number alone, so two repos' `#12` in one plan are the same row. The
+  the args, nor a card or phone number (`1234-5678-9012`,
+  `1234 5678 9012 3456`, `555 123 4567`). Plan items name work items by number alone, so two repos' `#12` in one plan are the same row. The
   board starts nothing from a plan.
 - `server/serve.py`: optional stdlib server for the board folder, but `/`
   comes from `dashboard/index.html` in the repo. It turns off `SO_REUSEADDR` on
@@ -116,7 +135,10 @@ A call without `status` only sets `progress` (`boardStatus` and `progressOf`
 in `lib.ts`) and never touches `done`; the tool's description keeps the two
 uses apart so a step doesn't get called `done`. A subagent's progress call is
 ignored. `done`, a slash command other than `skill.name` (not a job firing)
-and `/clear` clear `progress`. The tile shows it in place of `phaseOf` while
+and `/clear` clear `progress`. A built-in housekeeping command
+(`housekeepingCommand` in `lib.ts`: `/reload-plugins`, `/rename`, …) typed as a
+prompt changes none of `progress`, `skill`, `prompt`, `turns`, `waiting` or a plan's
+gate; it is logged as a `session` event, so a done tile doesn't count it. The tile shows it in place of `phaseOf` while
 the session is running, waiting or in the background (an idle one may have stopped),
 formatted by `progressText`, which the page and `lib.ts` each keep in step by hand.
 
@@ -166,7 +188,12 @@ SESSION_BOARD_DIR=<scratch dir> claude -p --plugin-dir . --model haiku "<prompt 
   never block a tool call.
 - In tests, a hook that answers `tool.call` returns `{ result }`.
 - `turn.step` streams: its hook and its `.catch` handler are both
-  `async function*`, and forward the stream with `yield* next(e)`.
+  `async function*`, and forward the stream with `yield* next(e)`, or
+  through `streamed()` in `lib.ts`, which forwards it and notes each chunk.
+  The `.catch` handler calls `next(e)` only when the hook hadn't
+  (`next.called`): a model stream that fails mid-stream reaches it, and there
+  `next(e)` sends the request again after its first chunks were shown, so it
+  rethrows instead (#73).
 
 ## What the events look like in practice
 
@@ -211,10 +238,11 @@ SESSION_BOARD_DIR=<scratch dir> claude -p --plugin-dir . --model haiku "<prompt 
 
 ## Not verified yet
 
-- Whether a resumed session's `costUsd` restarts at 0 or carries the earlier
-  cost. `costDayOf` handles either, as long as the ended status file is there.
-  That needs `/clear` and a resume to keep the session id; with a new id the
-  old and new files would both count the carried cost.
+- Whether `/resume` inside a running session gives the same id and cost as
+  `claude --resume` (same id, cost carried on; checked headless in #63), or
+  carries the cost of the session it leaves into the one it opens, and what
+  a fork (`claude --resume --fork-session`) does. A new id with a carried
+  cost would count it in both the old and the new file (#63).
 - An actual start from the queue: the Windows Terminal tab, that
   `--session-id` gives the status file the name the queue waits for, and that
   a delivery run calls `board_status` at its end without being told to.

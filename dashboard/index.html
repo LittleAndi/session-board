@@ -680,6 +680,7 @@
       <span id="notify-blocked" hidden title="this browser blocks notifications from the board: allow them in its site settings">blocked</span>
       <button type="button" id="notify-mute" aria-pressed="false" hidden title="no desktop notifications for now">mute</button>
       <button type="button" id="notify-long" aria-pressed="false" hidden title="also notify when a turn that ran 3 minutes or longer ends">long turns</button>
+      <button type="button" id="notify-stall" aria-pressed="false" hidden title="also notify when a running session starts to look stalled">stalls</button>
     </div>
   </div>
   <div class="ram-break"></div>
@@ -714,7 +715,7 @@
 
 <script>
 const POLL_MS = 2000
-const HIDDEN_POLL_MS = 15_000    // tab not visible: only the title and favicon update
+const HIDDEN_POLL_MS = 15_000    // tab not visible: only the title, favicon and notifications update
 const STALE_MS = 20_000          // no heartbeat for this long: the session is gone
 const HIDE_AFTER_MS = 24 * 3600_000
 const RECHECK_STALE_MS = 30_000  // how often to refetch a session without heartbeat
@@ -777,7 +778,8 @@ async function loadSessions() {
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const NUMBER_KEYS = new Set(['startedAt', 'updatedAt', 'stateSince', 'promptAt', 'at', 'since', 'until', 't',
-  'turns', 'costUsd', 'usd', 'percent', 'tokens', 'window', 'nextAt', 'firedAt', 'endedAt', 'createdAt', 'offsetMs', 'number'])
+  'turns', 'costUsd', 'usd', 'percent', 'tokens', 'window', 'nextAt', 'firedAt', 'endedAt', 'createdAt', 'offsetMs', 'number',
+  'lastStepAt', 'lastToolEnd'])
 const LIST_KEYS = ['prs', 'tools', 'agents', 'events', 'crons', 'shells', 'messages']
 const TEXT_KEYS = ['cwd', 'project', 'branch', 'tabTitle', 'model', 'prompt', 'workItem', 'activeSkill', 'endReason']
 
@@ -1340,18 +1342,34 @@ const toolLimit = (t) => Object.hasOwn(TOOL_LIMIT_MS, t.tool) ? TOOL_LIMIT_MS[t.
 const AGENT_TOOLS = new Set(['Agent', 'Task', 'Workflow'])
 const newest = (list, key) => list?.reduce((m, x) => Math.max(m, x?.[key] ?? 0), 0) ?? 0
 
-// Not everything a session does leaves a time in its file: a tool that ends,
-// or a Read or Grep, which writes no event, just drops out of `tools`. So the
-// page also notes when it last saw a session's file change in anything but its
-// heartbeat. It starts counting when the page first sees the session: the
-// file's own times can't say whether a tool just ended.
-const seen = new Map()  // sessionId -> { sig, at }
+// Not everything a session does leaves a time in its file: a tool that ends, or
+// a Read or Grep, which writes no event, just drops out of `tools`, and a
+// streamed answer only moves `lastStepAt` on. So the page also notes when it
+// last saw a session's file change in anything but its heartbeat. When it first
+// sees a session whose hooks write `lastToolEnd` (null until a tool ends), it
+// counts from the newest time in the file, so a reload doesn't restart the
+// count. Without that field the file's times can't say whether a tool just
+// ended, so it counts from then. So does a main-loop Agent call in flight: its
+// subagent's Reads and Greps leave no time in the file.
+const seen = new Map()  // sessionId -> { sig, at, blind? }
+function lastActive(s, now) {
+  if (!('lastToolEnd' in s) || s.tools.some((t) => !t.agentId && AGENT_TOOLS.has(t.tool))) return now
+  const t = Math.max(...[s.lastToolEnd, s.lastStepAt, s.promptAt, s.stateSince, newest(s.events, 't'), newest(s.messages, 't'),
+    newest(s.agents, 'since'), newest(s.agents, 'endedAt'), newest(s.shells, 'since'), newest(s.crons, 'firedAt'), s.skill?.at, s.done?.at]
+    .map((v) => Number.isFinite(v) ? v : 0))
+  return t > 0 ? Math.min(t, now) : now
+}
 function noteActivity(s, now) {
   const sig = JSON.stringify([s.state, s.turns, s.tools.map((t) => t.id), s.events.length, s.events.at(-1)?.t,
-    s.agents.map((a) => [a.key, a.status, a.lastTool]), s.messages?.length, s.shells?.map((b) => b.id), s.prs?.length])
+    s.agents.map((a) => [a.key, a.status, a.lastTool]), s.messages?.length, s.shells?.map((b) => b.id), s.prs?.length,
+    s.lastStepAt, s.lastToolEnd])
   const was = seen.get(s.sessionId)
   if (was?.sig === sig) return
-  seen.set(s.sessionId, { sig, at: now })
+  const at = was ? now : lastActive(s, now)
+  // blind: counting from first sight, as the file couldn't say how long it had
+  // been quiet. A quiet stall counted that way may have begun before the page
+  // loaded, so it doesn't notify.
+  seen.set(s.sessionId, { sig, at, blind: !was && at === now })
 }
 
 // null, or { since, tool?, text } for a stalled session. Only the main loop's
@@ -1758,7 +1776,8 @@ function render() {
   const now = Date.now()
   for (const s of sessions) noteActivity(s, now)
   stalls = new Map(sessions.map((s) => [s.sessionId, stallOf(s, now)]))
-  for (const id of seen.keys()) if (!stalls.has(id)) seen.delete(id)
+  // A session missing from one poll (a file read mid-write) keeps its count.
+  for (const [id, v] of seen) if (!stalls.has(id) && now - v.at > 60 * 60_000) seen.delete(id)
   const active = sessions.filter((s) => s.state !== 'ended' && !isStale(s))
   const past = sessions.filter((s) => (s.state === 'ended' || isStale(s)) && now - s.updatedAt < HIDE_AFTER_MS)
   // Never sort on heartbeats or busy/idle: they change every few seconds and
@@ -2086,6 +2105,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.closest('#notify-ask')) return void Notification.requestPermission().then(renderNotify, renderNotify)
   if (e.target.closest('#notify-mute')) return setNotify('notifyMute', notifyMute = !notifyMute)
   if (e.target.closest('#notify-long')) return setNotify('notifyLong', notifyLong = !notifyLong)
+  if (e.target.closest('#notify-stall')) return setNotify('notifyStall', notifyStall = !notifyStall)
   const tile = e.target.closest('[data-session]')
   if (tile) return openDrawer(tile.dataset.session)
   if (e.target.closest('[data-close]')) closeDrawer()
@@ -2299,12 +2319,16 @@ const LONG_TURN_MS = 3 * 60_000
 const NOTIFY_OK = 'Notification' in window && window.isSecureContext
 let notifyMute = false
 let notifyLong = false
+let notifyStall = false  // off by default: the stall limits are guesses
 try {
   notifyMute = !!localStorage.getItem('sessionBoard.notifyMute')
   notifyLong = !!localStorage.getItem('sessionBoard.notifyLong')
+  notifyStall = !!localStorage.getItem('sessionBoard.notifyStall')
 } catch {}
 const waitNoted = new Map()  // sessionId -> waiting.since last notified
 const stateWas = new Map()   // sessionId -> its state at the previous poll
+const stallWas = new Map()   // sessionId -> whether it looked stalled at the previous poll
+const stallNoted = new Map() // sessionId -> key of the stall last notified
 const turns = new Map()      // sessionId -> { n, ms, from }: turn number, working time so far, open stretch
 const lastSeen = new Map()   // sessionId -> when a poll last listed it
 const FORGET_MS = 60_000     // a file can miss a poll (read mid-write): keep what we know this long
@@ -2317,9 +2341,10 @@ function renderNotify() {
   const perm = Notification.permission
   $('notify-ask').hidden = perm !== 'default'
   $('notify-blocked').hidden = perm !== 'denied'
-  $('notify-mute').hidden = $('notify-long').hidden = perm !== 'granted'
+  $('notify-mute').hidden = $('notify-long').hidden = $('notify-stall').hidden = perm !== 'granted'
   $('notify-mute').setAttribute('aria-pressed', String(notifyMute))
   $('notify-long').setAttribute('aria-pressed', String(notifyLong))
+  $('notify-stall').setAttribute('aria-pressed', String(notifyStall))
 }
 
 function setNotify(key, on) {
@@ -2335,6 +2360,9 @@ function noteTransitions(list, now) {
     if (now - at <= FORGET_MS) continue
     for (const m of [lastSeen, waitNoted, stateWas, turns]) m.delete(id)
   }
+  // Stall history lasts as long as the quiet count in `seen` does, so a session
+  // that misses polls for a while still notifies for a stall that began meanwhile.
+  for (const m of [stallWas, stallNoted]) for (const id of m.keys()) if (!seen.has(id)) m.delete(id)
   for (const s of list) {
     if (s.sandboxed) continue
     const id = s.sessionId
@@ -2353,6 +2381,21 @@ function noteTransitions(list, now) {
       }
     }
     noteTurn(s, now)
+    // A stall the page saw begin, from `stalls` as this poll's render worked
+    // it out. Sessions already stalled when the page first lists them stay
+    // quiet, and one stall notifies once however long it lasts: a poll where
+    // the file is stale (a late heartbeat, a PC waking up) says nothing, and
+    // the same overdue tool or quiet stretch coming back doesn't notify again.
+    const stall = stalls.get(id)
+    const stallBefore = stallWas.get(id)
+    if (!isStale(s)) stallWas.set(id, !!stall)
+    if (stall && stallBefore === false && !isStale(s) && (stall.tool || !seen.get(id)?.blind)) {
+      const key = stall.tool ? `tool:${stall.tool.id}` : `quiet:${stall.since}`
+      if (stallNoted.get(id) !== key) {
+        stallNoted.set(id, key)
+        if (notifyStall) notify(s, 'stall', now - stall.since, stall)
+      }
+    }
   }
   notifyPrimed = true
 }
@@ -2386,18 +2429,26 @@ function noteTurn(s, now) {
   }
 }
 
-function notify(s, kind, took = 0) {
+function notify(s, kind, took = 0, stall = null) {
   if (!NOTIFY_OK || notifyMute || Notification.permission !== 'granted') return
   const name = [projectOf(s), s.tabTitle].filter(Boolean).join(' · ')
   const what = s.workItem ? `#${s.workItem}` : s.prompt ? firstSentence(s.prompt) : ''
-  const title = kind === 'waiting' ? `Needs you: ${name}` : `Turn ended: ${name}`
+  const title = { waiting: `Needs you: ${name}`, stall: `Looks stalled: ${name}` }[kind] || `Turn ended: ${name}`
   const reason = { question: 'Has a question', plan: 'Plan to approve' }[s.waiting?.kind] || 'Waiting for you'
   const body = kind === 'waiting'
     ? (s.waiting.detail ? `${reason}: ${s.waiting.detail}` : reason)
-    : [`Ran ${dur(took)}`, what].filter(Boolean).join(' · ')
+    : kind === 'stall'
+      ? [stall.tool ? `${stall.tool.tool} running for ${dur(took)}` : `Quiet for ${dur(took)}`, what].filter(Boolean).join(' · ')
+      : [`Ran ${dur(took)}`, what].filter(Boolean).join(' · ')
   try {
     // The tag keeps two open boards from showing the same notification twice.
-    const n = new Notification(title, { body: body.slice(0, 240), tag: `${s.sessionId}:${kind}:${s.stateSince}` })
+    // A quiet stall's `since` is when this page saw the file change, which
+    // another board sees at another moment, so its tag names what the file
+    // says last happened instead, which a later quiet stall changes.
+    const at = stall
+      ? (stall.tool ? stall.tool.id : `quiet:${s.turns}:${s.lastStepAt ?? ''}:${s.lastToolEnd ?? ''}:${s.events.length}`)
+      : s.stateSince
+    const n = new Notification(title, { body: body.slice(0, 240), tag: `${s.sessionId}:${kind}:${at}` })
     n.onclick = () => {
       window.focus()
       n.close()
@@ -2410,10 +2461,37 @@ function notify(s, kind, took = 0) {
 
 let pollTimer = null
 let polling = false
+let polledOnce = false
+
+// Chrome and Edge slow a hidden tab's own timers to about once a minute after
+// a few minutes, which would hold a notification back that long. A dedicated
+// worker's timers aren't slowed that way, so one times the polls while the tab
+// is hidden. Without workers the page's own timer does.
+let pollWorker = null
+try {
+  const src = 'let t; onmessage = (e) => { clearTimeout(t); if (e.data > 0) t = setTimeout(() => postMessage(0), e.data) }'
+  // One small blob per load, kept: revoking it before the worker has read it
+  // fails in some browsers.
+  pollWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })))
+  // A wait that fired just as the tab came back may still arrive: the visible
+  // tab's own timer has taken over by then.
+  pollWorker.onmessage = () => { if (document.hidden) poll() }
+  // Before the first poll there's nothing to reschedule; that poll's finally does it.
+  pollWorker.onerror = () => { pollWorker = null; if (polledOnce && !polling) schedulePoll() }
+} catch { pollWorker = null }
+
+function schedulePoll() {
+  clearTimeout(pollTimer)
+  pollWorker?.postMessage(0)
+  if (document.hidden && pollWorker) pollWorker.postMessage(HIDDEN_POLL_MS)
+  else pollTimer = setTimeout(poll, document.hidden ? HIDDEN_POLL_MS : POLL_MS)
+}
+
 async function poll() {
   if (polling) return
   polling = true
   clearTimeout(pollTimer)
+  pollWorker?.postMessage(0)
   const status = $('status')
   try {
     sessions = await loadSessions()
@@ -2429,7 +2507,8 @@ async function poll() {
     status.innerHTML = `<span class="dot"></span>${esc(err.message)}`
   } finally {
     polling = false
-    pollTimer = setTimeout(poll, document.hidden ? HIDDEN_POLL_MS : POLL_MS)
+    polledOnce = true
+    schedulePoll()
   }
 }
 

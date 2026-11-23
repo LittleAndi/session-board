@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { STALE_BOARD_MS, removeScript, staleBoards, costDayOf, localDay, addMessage, crossSessionMessage, peerNotice, sendTarget, MAX_MESSAGES, boardStatus, progressOf, progressText, boardPlan, planWaiting, plannedWork, pruneShells, shellReported, shellToolDone, SHELL_MAX_MS, addPrs, adoOrgOf, cronFired, cronToolDone, nextCronMatch, pruneCrons, CRON_EXPIRY_MS, WAKEUP_ID, adoPrLink, adoPrLookupOf, adoPrShowArgv, adoRepoOf, cacheTtlOf, childLabel, deriveState, freshBoard, memoryOf, parseMachine, parseProbe, prLinksOf, prsOfTool, pushEvent, projectDirName, scansForPrs, sessionTitleOf, slashCommand, summarize, toolLabel, trimAgents, workItemOf, MAX_AGENTS, MAX_EVENTS, MEMORY_HISTORY, type ProcRec } from './lib'
+import { STALE_BOARD_MS, removeScript, staleBoards, costDayOf, localDay, addMessage, crossSessionMessage, peerNotice, sendTarget, MAX_MESSAGES, boardStatus, progressOf, progressText, boardPlan, planWaiting, plannedWork, pruneShells, shellReported, shellToolDone, SHELL_MAX_MS, addPrs, adoOrgOf, cronFired, cronToolDone, nextCronMatch, pruneCrons, CRON_EXPIRY_MS, WAKEUP_ID, adoPrLink, adoPrLookupOf, adoPrShowArgv, adoRepoOf, cacheTtlOf, stepSeen, streamed, toolEndSeen, childLabel, deriveState, freshBoard, memoryOf, parseMachine, parseProbe, prLinksOf, prsOfTool, pushEvent, projectDirName, scansForPrs, sessionTitleOf, slashCommand, housekeepingCommand, summarize, toolLabel, trimAgents, workItemOf, skillTakesWorkItem, skillWorkItem, skillRulesOf, DEFAULT_SKILL_RULES, MAX_AGENTS, MAX_EVENTS, MEMORY_HISTORY, type ProcRec } from './lib'
 
 describe('summaries', () => {
   test('a tool call becomes one short line', async () => {
@@ -16,12 +16,140 @@ describe('summaries', () => {
     expect(slashCommand('<command-message>log-check</command-message>\n<command-name>/log-check</command-name>\n<command-args>yesterday</command-args>'))
       .toEqual({ name: 'log-check', args: 'yesterday' })
     expect(slashCommand('<command-message>log-check</command-message> is running…')).toEqual({ name: 'log-check', args: '' })
+    // Long args come back whole, so a work item past 200 characters is still read.
+    const long = `10m /work-item-delivery ${'check the nightly export and list what is missing, '.repeat(5)}then 25229`
+    expect(slashCommand(`/loop ${long}`)?.args).toBe(long)
+    expect(slashCommand(`<command-name>/loop</command-name>\n<command-args>${long}</command-args>`)?.args).toBe(long)
+    for (const name of ['reload-plugins', 'rename', '/model', 'Compact'])
+      expect(housekeepingCommand(name)).toBe(true)
+    for (const name of ['clear', 'resume', 'rewind', 'status', 'export', 'gh-issue-delivery', 'code-review', 'loop', 'init', ''])
+      expect(housekeepingCommand(name)).toBe(false)
     expect(workItemOf('continue on #1234', false)).toBe('1234')
     expect(workItemOf('deliver 1234', false)).toBe(null)
     expect(workItemOf('1234, use autocomplete', true)).toBe('1234')
     // /deliver as orchestrate-delivery starts it: the issue URL wins over other digits.
     expect(workItemOf('https://github.com/o/r/issues/12 medium report-to=orch-2024 name=dlv-12', true)).toBe('12')
     expect(workItemOf('see https://github.com/o/r/issues/12', false)).toBe(null)
+    // A "#" inside a URL or glued to a word names no item; Azure Boards' AB#1234 does.
+    expect(workItemOf('see https://wiki/page#2345', false)).toBe(null)
+    expect(workItemOf('see https://wiki/#2345', false)).toBe(null)
+    expect(workItemOf('page#2345', true)).toBe(null)
+    expect(workItemOf('fix (#1234)', false)).toBe('1234')
+    expect(workItemOf('#1234', false)).toBe('1234')
+    expect(workItemOf('fixes AB#1234', false)).toBe('1234')
+    expect(workItemOf('AB#1234', false)).toBe('1234')
+    expect(workItemOf('XAB#1234', false)).toBe(null)
+    expect(workItemOf('page#2345 then #1234', false)).toBe('1234')
+    expect(workItemOf('fixes ab#1234', false)).toBe('1234')
+    expect(workItemOf('continue on WI#1234', false)).toBe(null)
+    expect(workItemOf('see https://en.wikipedia.org/wiki/Foo_(bar)#1234', false)).toBe(null)
+    expect(workItemOf('https://x/page-#1234', true)).toBe(null)
+    expect(workItemOf('fix owner/repo#1234', false)).toBe('1234')
+    expect(workItemOf('o/r#1234 medium', true)).toBe('1234')
+    expect(workItemOf('see https://github.com/o/r#1234', false)).toBe(null)
+    expect(workItemOf('Fixes (owner/repo#1234)', false)).toBe('1234')
+    expect(workItemOf('"o/r#1234"', false)).toBe('1234')
+    expect(workItemOf('wiki-page-#1234', false)).toBe(null)
+    expect(workItemOf('see wiki.example.com/page#2345', false)).toBe(null)
+    expect(workItemOf('a/b/c#1234', false)).toBe(null)
+    expect(workItemOf('xab#1234', false)).toBe(null)
+    // A long run without spaces before a "#" stays cheap.
+    const run = 'x'.repeat(100_000)
+    const start = Date.now()
+    expect(workItemOf(`${run}#1234 ${run}`, false)).toBe(null)
+    expect(Date.now() - start).toBeLessThan(500)
+  })
+
+  test('only delivery and orchestrate skills read a bare number as the work item', async () => {
+    for (const name of ['deliver', 'deliver-story', 'gh-issue-delivery', 'work-item-delivery', 'orchestrate-delivery', 'gh-orchestrate-delivery', 'orchestrate', 'tools:deliver'])
+      expect(skillTakesWorkItem(name)).toBe(true)
+    for (const name of ['code-review', 'security-review', 'pr', 'loop', 'log-check', 'delivery-report', 'undelivered-orders', 'check-deliveries'])
+      expect(skillTakesWorkItem(name)).toBe(false)
+    expect(skillWorkItem('deliver', '1234, use autocomplete')).toBe('1234')
+    expect(skillWorkItem('gh-issue-delivery', 'https://github.com/o/r/issues/49 medium')).toBe('49')
+    expect(skillWorkItem('code-review', 'high 1234')).toBe(null)
+    expect(skillWorkItem('code-review', 'medium #1234')).toBe(null)
+    expect(skillWorkItem('delivery-report', '123456')).toBe(null)
+    // A wrapper skill gives the work item of the command it runs.
+    expect(skillWorkItem('loop', '5m /work-item-delivery 25229')).toBe('25229')
+    expect(skillWorkItem('loop', '10m /gh-issue-delivery https://github.com/o/r/issues/49')).toBe('49')
+    expect(skillWorkItem('loop', '5m /code-review high 1234')).toBe(null)
+    expect(skillWorkItem('loop', '/deliver 1234')).toBe('1234')
+    expect(skillWorkItem('loop', '10m check CI on #1234')).toBe('1234')
+    expect(skillWorkItem('schedule', 'daily deliver #1234')).toBe('1234')
+    // "#1234" counts for any skill but one that takes a PR; a bare number doesn't.
+    expect(skillWorkItem('fix-issue', '#1234')).toBe('1234')
+    expect(skillWorkItem('fix-issue', '1234')).toBe(null)
+    expect(skillWorkItem('security-review', '#1234')).toBe(null)
+    // Only a wrapper runs a command, and only one that opens its args.
+    expect(skillWorkItem('code-review', 'explain why /deliver 1234 failed')).toBe(null)
+    expect(skillWorkItem('fix-issue', 'see /deliver 1234')).toBe(null)
+    expect(skillWorkItem('loop', '5m see /deliver 1234')).toBe(null)
+  })
+
+  test('skills.json replaces the lists of skill names it gives', async () => {
+    // Out of the box a delivery skill by another name gets no work item from
+    // a bare number, and a skill ending in -delivery does.
+    expect(skillWorkItem('deliver-issue', '1234')).toBe(null)
+    expect(skillWorkItem('implement-story', '1234')).toBe(null)
+    expect(skillWorkItem('order-delivery', '1234')).toBe('1234')
+    const rules = skillRulesOf({
+      workItem: ['^(?:[\\w-]+:)?(?:deliver-issue|implement-story|gh-issue-delivery)$'],
+      pr: ['review$'],
+      wrapper: ['^every$'],
+    })
+    expect(skillWorkItem('deliver-issue', '1234', rules)).toBe('1234')
+    expect(skillWorkItem('tools:implement-story', 'https://github.com/o/r/issues/49', rules)).toBe('49')
+    expect(skillWorkItem('order-delivery', '1234', rules)).toBe(null)
+    expect(skillWorkItem('order-delivery', '#1234', rules)).toBe('1234')
+    expect(skillTakesWorkItem('DELIVER-ISSUE', rules)).toBe(true)
+    expect(skillWorkItem('code-review', '#1234', rules)).toBe(null)
+    // pr was replaced: "simplify" takes a work item again.
+    expect(skillWorkItem('simplify', '#1234', rules)).toBe('1234')
+    expect(skillWorkItem('every', '5m /deliver-issue 1234', rules)).toBe('1234')
+    expect(skillWorkItem('loop', '5m /deliver-issue 1234', rules)).toBe(null)
+  })
+
+  test('skills.json keeps the default of a list it leaves out or gets wrong', async () => {
+    for (const json of [null, 'x', 42, [], {}, { workItem: 'deliver$' }, { workItem: [1] }])
+      expect(skillRulesOf(json)).toEqual(DEFAULT_SKILL_RULES)
+    // A bad regex skips that entry only.
+    const rules = skillRulesOf({ workItem: ['(', '^deliver-issue$'] })
+    expect(skillTakesWorkItem('deliver-issue', rules)).toBe(true)
+    expect(skillTakesWorkItem('deliver', rules)).toBe(false)
+    expect(rules.pr).toBe(DEFAULT_SKILL_RULES.pr)
+    // An empty list matches nothing, and so does one where nothing compiles.
+    expect(skillWorkItem('loop', '5m /deliver 1234', skillRulesOf({ wrapper: [] }))).toBe(null)
+    expect(skillWorkItem('order-delivery', '1234', skillRulesOf({ workItem: ['^(deliver-issue$'] }))).toBe(null)
+  })
+
+  test('skills.json says what it ignored', async () => {
+    const ignoredOf = (json: unknown) => {
+      const ignored: string[] = []
+      skillRulesOf(json, ignored)
+      return ignored
+    }
+    expect(ignoredOf({})).toEqual([])
+    expect(ignoredOf({ workItem: ['^deliver-issue$'], pr: [], wrapper: ['^every$'] })).toEqual([])
+    for (const json of [null, 'x', 42, []]) expect(ignoredOf(json)).toEqual(['not a JSON object, so every default applies'])
+    // A misspelled key keeps the defaults, and says so.
+    expect(ignoredOf({ workitem: ['^deliver-issue$'], PR: [] })).toEqual(['unknown key "workitem" ignored', 'unknown key "PR" ignored'])
+    expect(skillRulesOf({ workitem: ['^deliver-issue$'] })).toEqual(DEFAULT_SKILL_RULES)
+    expect(ignoredOf({ workItem: 'deliver$' })).toEqual(['"workItem" is not a list of strings, so its default applies'])
+    expect(ignoredOf({ pr: [1], wrapper: null })).toEqual([
+      '"pr" is not a list of strings, so its default applies',
+      '"wrapper" is not a list of strings, so its default applies',
+    ])
+    expect(ignoredOf({ workItem: ['(', '^deliver-issue$', '[a'] })).toEqual([
+      '"workItem" pattern "(" doesn\'t compile, skipped',
+      '"workItem" pattern "[a" doesn\'t compile, skipped',
+    ])
+    // A long pattern is cut, so the reasons after it still fit in the event.
+    for (const json of [{ pr: ['(' + 'x'.repeat(200)] }, { pr: ['(' + '\\d'.repeat(100)] }, { ['k'.repeat(300)]: [] }]) {
+      const [long] = ignoredOf(json)
+      expect(long!.length).toBeLessThan(90)
+    }
+    expect(ignoredOf({ 'a"b': [] })).toEqual(['unknown key "a\\"b" ignored'])
   })
 
   test('years and dates are not work items', async () => {
@@ -50,6 +178,45 @@ describe('summaries', () => {
     expect(workItemOf('1500.50 then 25229', true)).toBe('25229')
     expect(workItemOf('build 1.2.12345', true)).toBe(null)
     expect(workItemOf('2026-1-12345', true)).toBe(null)
+  })
+
+  test('card and phone numbers are not work items', async () => {
+    expect(workItemOf('1234-5678-9012', true)).toBe(null)
+    expect(workItemOf('card 1234-5678-9012-3456 then 25229', true)).toBe('25229')
+    expect(workItemOf('1234 5678 9012 3456', true)).toBe(null)
+    expect(workItemOf('1234\u00a05678\u00a09012\u00a03456', true)).toBe(null)
+    expect(workItemOf('1234 5678 9012 3456 25229', true)).toBe('25229')
+    expect(workItemOf('call 555 123 4567', true)).toBe(null)
+    expect(workItemOf('+46 8 1234 5678', true)).toBe(null)
+    expect(workItemOf('08-1234 5678', true)).toBe(null)
+    expect(workItemOf('1234-56789012', true)).toBe(null)
+    expect(workItemOf('#1234-5678-9012', false)).toBe(null)
+    expect(workItemOf('#1234 5678 9012 3456', false)).toBe(null)
+    expect(workItemOf('#1234-56789012', false)).toBe(null)
+    expect(workItemOf('#1234-5678-9012 and #25229', false)).toBe('25229')
+    // Pairs and lists of items still count.
+    expect(workItemOf('25229-25231', true)).toBe('25229')
+    expect(workItemOf('25229 25230', true)).toBe('25229')
+    expect(workItemOf('30395 30396 30397', true)).toBe('30395')
+    expect(workItemOf('30395-30396-30397', true)).toBe('30395')
+    expect(workItemOf('#30395-30396-30397', false)).toBe('30395')
+    expect(workItemOf('4512 4513 4514', true)).toBe('4512')
+    expect(workItemOf('1234 5678', true)).toBe('1234')
+    expect(workItemOf('2026-10-31 25229', true)).toBe('25229')
+    expect(workItemOf('25229 3 times', true)).toBe('25229')
+    expect(workItemOf('25229 20261122', true)).toBe('25229')
+    expect(workItemOf('4512 4513 4514 4515 4516', true)).toBe('4512')
+    expect(workItemOf('/deliver 4512 2 3', true)).toBe('4512')
+    expect(workItemOf('#4512 2 3', false)).toBe('4512')
+    expect(workItemOf('2026-10-31 4512', true)).toBe('4512')
+    expect(workItemOf('1234  5678  9012  3456', true)).toBe(null)
+    expect(workItemOf('555 - 123 - 4567', true)).toBe(null)
+    // Long runs stay cheap.
+    for (const text of [`${'1 '.repeat(50_000)}x`, '1234 5678 9012 3456, '.repeat(10_000)]) {
+      const start = Date.now()
+      expect(workItemOf(text, true)).toBe(null)
+      expect(Date.now() - start).toBeLessThan(2000)
+    }
   })
 })
 
@@ -249,6 +416,199 @@ test('a subagent turn inside the main turn neither ends nor hides it', async ($,
   expect(board.turns).toBe(1)
 })
 
+test('a skill that takes a PR number does not set the work item', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  mock.env(on, { SESSION_BOARD_DIR: '/board' })
+  const files = new Map<string, string>()
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }))
+  const status = async () => {
+    await clock.advance(1_000)
+    const [, text] = [...files].find(([path]) => /[\\/]sessions[\\/]s1\.json$/.test(path)) ?? []
+    return JSON.parse(text ?? '{}')
+  }
+  const turn = async (text: string, turnId: string, skill?: { skill: string; args: string }) => {
+    await $.turn.start({ text, turnId })
+    if (skill) await $.tool.call({ tool: 'Skill', ...skill })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId, reason: 'answer' })
+  }
+
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  await turn('/code-review high 1234', 't1')
+  expect((await status()).workItem ?? null).toBe(null)
+  await turn('/code-review medium #1234', 't1b')
+  expect((await status()).workItem ?? null).toBe(null)
+
+  await turn('/gh-issue-delivery https://github.com/o/r/issues/49 medium', 't2')
+  expect((await status()).workItem).toBe('49')
+  // The delivery runs code-review on its PR in a later turn: the work item stays.
+  await turn('<agent-message from="a1">verified</agent-message>', 't3', { skill: 'code-review', args: 'medium 1234' })
+  expect((await status()).workItem).toBe('49')
+  await turn('/code-review high #1234', 't4')
+  expect((await status()).workItem).toBe('49')
+  await turn('/fix-issue #1301', 't4b')
+  expect((await status()).workItem).toBe('1301')
+  // A plain prompt still names a work item with "#".
+  await turn('now continue on #1300', 't5')
+  expect((await status()).workItem).toBe('1300')
+  await turn('/loop 5m /work-item-delivery 25229', 't6')
+  expect((await status()).workItem).toBe('25229')
+})
+
+test('skills.json in the board folder decides which skills take a work item', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  mock.env(on, { SESSION_BOARD_DIR: '/board' })
+  const files = new Map<string, string>()
+  // The engine resolves the board folder to an absolute path.
+  const skillsJson = (path: string) => /[\\/]board[\\/]skills\.json$/.test(path)
+  // Saved with a byte-order mark, as Windows PowerShell 5.1 does.
+  let rules = '\u{FEFF}' + JSON.stringify({ workItem: ['^deliver-issue$'] })
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('fs.exists', (_$, e) => ({ value: skillsJson(e.path) || files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: skillsJson(e.path) ? rules : files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  const status = async () => {
+    await clock.advance(1_000)
+    const [, text] = [...files].find(([path]) => /[\\/]sessions[\\/]s1\.json$/.test(path)) ?? []
+    return JSON.parse(text ?? '{}')
+  }
+  const turn = async (text: string, turnId: string) => {
+    await $.turn.start({ text, turnId })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId, reason: 'answer' })
+  }
+
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  await turn('/order-delivery 1234', 't1')
+  expect((await status()).workItem ?? null).toBe(null)
+  await turn('/deliver-issue 4321', 't2')
+  expect((await status()).workItem).toBe('4321')
+
+  // A broken file leaves the defaults and says so in the events.
+  rules = '{ workItem: '
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  const after = await status()
+  expect(after.events.some((e: { text: string }) => e.text.startsWith('skills.json unreadable'))).toBe(true)
+  await turn('/order-delivery 1234', 't3')
+  expect((await status()).workItem).toBe('1234')
+})
+
+test('a housekeeping command keeps the skill and its progress report', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  mock.env(on, { SESSION_BOARD_DIR: '/board' })
+  const files = new Map<string, string>()
+  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  const status = async () => {
+    await clock.advance(1_000)
+    const [, text] = [...files].find(([path]) => /[\\/]sessions[\\/]s1\.json$/.test(path)) ?? []
+    return JSON.parse(text ?? '{}')
+  }
+  const turn = async (text: string, turnId: string) => {
+    await $.turn.start({ text, turnId })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId, reason: 'answer' })
+  }
+
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  await $.turn.start({ text: '/gh-issue-delivery https://github.com/o/r/issues/58 medium', turnId: 't1' })
+  await $.tool.call({ tool: 'mcp__session-board__board_status', phase: 'Implementing', workItem: '58' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect((await status()).progress?.phase).toBe('Implementing')
+
+  await turn('<command-message>reload-plugins</command-message>\n<command-name>/reload-plugins</command-name>\n<command-args></command-args>', 't2')
+  await turn('/rename delivery 58', 't3')
+  let board = await status()
+  expect(board.progress?.phase).toBe('Implementing')
+  expect(board.skill?.name).toBe('gh-issue-delivery')
+  expect(board.activeSkill).toBe('gh-issue-delivery')
+  expect(board.workItem).toBe('58')
+  expect(board.prompt).toBe('/gh-issue-delivery https://github.com/o/r/issues/58 medium')
+  expect(board.turns).toBe(1)
+  // Logged, but not as a prompt: a done tile doesn't count it as "+N prompts".
+  expect(board.events.find((e: { text: string }) => e.text === '/rename delivery 58')?.kind).toBe('session')
+
+  // Another skill is still a new task.
+  await turn('/code-review high 70', 't4')
+  board = await status()
+  expect(board.progress ?? null).toBe(null)
+  expect(board.skill?.name).toBe('code-review')
+
+  // A skill the model loads is recorded even if a built-in shares its name.
+  await $.turn.start({ text: 'check the status', turnId: 't5' })
+  await $.tool.call({ tool: 'Skill', skill: 'status', args: '' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't5', reason: 'answer' })
+  expect((await status()).activeSkill).toBe('status')
+})
+
+test('a long command keeps its work item and stores clipped args', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  mock.env(on, { SESSION_BOARD_DIR: '/board' })
+  const files = new Map<string, string>()
+  on('tool.call', { tool: 'Skill' }, () => ({ result: 'loaded' }))
+  on('session.id', () => ({ value: 's1' }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_$, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  const status = async () => {
+    await clock.advance(1_000)
+    const [, text] = [...files].find(([path]) => /[\\/]sessions[\\/]s1\.json$/.test(path)) ?? []
+    return JSON.parse(text ?? '{}')
+  }
+
+  const args = `10m /work-item-delivery ${'check the nightly export and list what is missing, '.repeat(5)}then 25229`
+  expect(args.length).toBeGreaterThan(200)
+  await $.session.start({ cwd: '/x', surface: null, isInteractive: true })
+  await $.turn.start({ text: `<command-message>loop</command-message>\n<command-name>/loop</command-name>\n<command-args>${args}</command-args>`, turnId: 't1' })
+  const board = await status()
+  expect(board.workItem).toBe('25229')
+  expect(board.skill?.name).toBe('loop')
+  expect(board.skill?.args.length).toBe(200)
+  expect(board.skill?.args.endsWith('…')).toBe(true)
+
+  // Args the model passes to the Skill tool are stored clipped too, and the
+  // work item is still read from them whole, not from the clipped copy.
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.start({ text: 'deliver the next one', turnId: 't2' })
+  await $.tool.call({ tool: 'Skill', skill: 'work-item-delivery', args: `${'use low review and keep the diff small, '.repeat(6)}then 25230` })
+  const next = await status()
+  expect(next.workItem).toBe('25230')
+  expect(next.skill?.name).toBe('work-item-delivery')
+  expect(next.skill?.args.length).toBe(200)
+})
+
 describe('prompt cache', () => {
   test('the TTL of the main thread newest cache write', async () => {
     const reply = (h1: number, m5: number, isSidechain = false) =>
@@ -257,6 +617,80 @@ describe('prompt cache', () => {
     expect(cacheTtlOf([reply(744, 0), reply(0, 900)].join('\n'))).toBe('5m')
     expect(cacheTtlOf([reply(0, 900), reply(0, 0), reply(744, 0, true)].join('\n'))).toBe('5m')
     expect(cacheTtlOf(JSON.stringify({ type: 'user', message: { content: 'hi' } }))).toBe(null)
+  })
+})
+
+describe('model steps', () => {
+  test('the main thread streaming moves lastStepAt on, a subagent does not', () => {
+    const b = freshBoard('s1', '/x', 0)
+    expect(b.lastStepAt ?? null).toBe(null)
+    stepSeen(b, undefined, 100)
+    expect(b.lastStepAt).toBe(100)
+    stepSeen(b, 'agent-1', 200)
+    expect(b.lastStepAt).toBe(100)
+    stepSeen(b, undefined, 50) // never goes back
+    expect(b.lastStepAt).toBe(100)
+    stepSeen(b, undefined, 300)
+    expect(b.lastStepAt).toBe(300)
+  })
+
+  test('a main-thread tool ending moves lastToolEnd on, a subagent one does not', () => {
+    const b = freshBoard('s1', '/x', 0)
+    expect(b.lastToolEnd).toBe(null) // present, so the page knows these hooks write it
+    toolEndSeen(b, undefined, 100)
+    expect(b.lastToolEnd).toBe(100)
+    toolEndSeen(b, 'agent-1', 200)
+    expect(b.lastToolEnd).toBe(100)
+    toolEndSeen(b, undefined, 50) // never goes back
+    expect(b.lastToolEnd).toBe(100)
+    toolEndSeen(b, undefined, 300)
+    expect(b.lastToolEnd).toBe(300)
+  })
+
+  test('streamed forwards a stream as yield* would and notes each chunk', async () => {
+    const got: unknown[] = []
+    async function* source() {
+      try {
+        got.push(yield 1)
+        got.push(yield 2)
+        return 'end'
+      } catch (err) {
+        got.push(`caught ${String(err)}`)
+        yield 9
+        return 'recovered'
+      } finally {
+        got.push('closed')
+      }
+    }
+    let n = 0
+    const all = streamed(source(), () => n++)
+    expect(await all.next()).toEqual({ value: 1, done: false })
+    expect(await all.next('a')).toEqual({ value: 2, done: false })
+    expect(await all.next('b')).toEqual({ value: 'end', done: true })
+    expect(got).toEqual(['a', 'b', 'closed'])
+    expect(n).toBe(2)
+
+    got.length = 0
+    const thrown = streamed(source(), () => { throw new Error('a bad note') })
+    await thrown.next()
+    expect(await thrown.throw('abort')).toEqual({ value: 9, done: false })
+    expect(await thrown.next()).toEqual({ value: 'recovered', done: true })
+    expect(got).toEqual(['caught abort', 'closed'])
+
+    got.length = 0
+    const closed = streamed(source(), () => {})
+    await closed.next()
+    await closed.return(undefined as never)
+    expect(got).toEqual(['closed'])
+
+    async function* failing() {
+      yield 1
+      throw new Error('network')
+    }
+    const failed = streamed(failing(), () => {})
+    expect(await failed.next()).toEqual({ value: 1, done: false })
+    await expect(failed.next()).rejects.toThrow('network')
+    expect(await failed.next()).toEqual({ value: undefined, done: true })
   })
 })
 
@@ -596,6 +1030,12 @@ test('a plan waiting for the go keeps the session waiting until the person repli
   expect(waiting.waiting?.kind).toBe('plan')
   expect(waiting.plan?.items?.[0]?.workItem).toBe('26099')
 
+  // A housekeeping command is no go: the plan still waits, even if no turn end follows.
+  await $.turn.start({ text: '/rename orchestrator', turnId: 't1b' })
+  expect((await status()).waiting?.kind).toBe('plan')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1b', reason: 'answer' })
+  expect((await status()).waiting?.kind).toBe('plan')
+
   await $.turn.start({ text: 'go', turnId: 't2' })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
   const after = await status()
@@ -701,7 +1141,7 @@ describe('messages between sessions', () => {
 
 test('the board never gets in the way of a message to another session', async ($, on) => {
   on('session.send', () => ({ isDelivered: true }))
-  const result = await $.session.send({ to: 'session-board-57', text: 'hello' })
+  const result = await $.session.send({ to: 'session-board-57', text: 'hello', origin: { kind: 'model' } })
   expect(result.isDelivered).toBe(true)
 })
 
@@ -808,5 +1248,62 @@ describe('old status files', () => {
     expect(script.startsWith(`Get-Item -LiteralPath 'C:/b/sessions/a.json','C:/O''Neil/s/b.json','C:/x${curly}${curly}y/c.json' `)).toBe(true)
     expect(script).toContain(`LastWriteTime -lt (Get-Date).AddMilliseconds(-${STALE_BOARD_MS})`)
     expect(script.endsWith('; exit 0')).toBe(true)
+  })
+})
+
+// #73: a model stream that fails after some chunks reaches the turn.step
+// hook's .catch, whose next(e) would send the request a second time.
+describe('turn.step failures', () => {
+  const step = (agentId?: string) => ({ turnId: 't1', index: 0, model: 'm', messageCount: 1, ...(agentId ? { agentId } : {}) })
+
+  async function drain(s: AsyncIterable<unknown>): Promise<{ chunks: unknown[]; failed: boolean }> {
+    const chunks: unknown[] = []
+    let failed = false
+    try {
+      for await (const c of s) chunks.push(c)
+    } catch {
+      failed = true
+    }
+    return { chunks, failed }
+  }
+
+  for (const agentId of [undefined, 'a1']) {
+    test(`a stream that fails mid-stream is not requested again (${agentId ? 'subagent' : 'main'})`, async ($, on) => {
+      let requests = 0
+      on('turn.step', async function* () {
+        requests++
+        yield { kind: 'text' as const, index: 0, text: 'part ' + requests }
+        throw new Error('stream broke')
+      })
+      const { chunks, failed } = await drain($.turn.step(step(agentId)))
+      expect(requests).toBe(1)
+      expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'part 1' }])
+      expect(failed).toBe(true)
+    })
+  }
+
+  test('a request that fails before any chunk is not sent again', async ($, on) => {
+    let requests = 0
+    on('turn.step', async function* () {
+      requests++
+      throw new Error('request failed')
+    })
+    const { chunks, failed } = await drain($.turn.step(step()))
+    expect(requests).toBe(1)
+    expect(chunks).toEqual([])
+    expect(failed).toBe(true)
+  })
+
+  test('a stream that ends normally passes through once', async ($, on) => {
+    let requests = 0
+    on('turn.step', async function* () {
+      requests++
+      yield { kind: 'text' as const, index: 0, text: 'hi' }
+      return { turnId: 't1', index: 0, answer: 'hi', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+    })
+    const { chunks, failed } = await drain($.turn.step(step()))
+    expect(requests).toBe(1)
+    expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'hi' }])
+    expect(failed).toBe(false)
   })
 })

@@ -117,6 +117,14 @@ export type Board = {
   // place of the phase inferred from subagents. Cleared by done, a new slash
   // command and /clear.
   progress?: Progress | null
+  // When the main thread's model last streamed: each chunk of a model request
+  // (turn.step) moves it on, and the heartbeat writes it. The page counts it as
+  // activity, so a long streamed answer doesn't look like a hung session.
+  lastStepAt?: number | null
+  // When a main-thread tool last ended, Read and Grep included. Kept so a page
+  // that loads later can tell how long the session has been quiet. A fresh
+  // board has it as null, which tells the page its hooks write it.
+  lastToolEnd?: number | null
 }
 
 // A session's cost at the start of a local day: `day` is YYYY-MM-DD in this
@@ -145,6 +153,49 @@ export function costDayOf(prev: CostDay | null | undefined, before: number | nul
   }
   if (!prev) return { day, usd: localDay(startedAt) === day ? 0 : usd }
   return { day, usd: reset ? 0 : Math.min(before ?? usd, usd) }
+}
+
+// Notes that the model streamed at `t`. A subagent's steps don't count: a
+// background agent streaming says nothing about whether the main loop hangs.
+export function stepSeen(b: Board, agentId: string | undefined, t: number): void {
+  if (agentId || t <= (b.lastStepAt ?? 0)) return
+  b.lastStepAt = t
+}
+
+// Notes that a tool ended at `t`. Like stepSeen, only the main thread's count:
+// a background agent's tools ending say nothing about whether the main loop hangs.
+export function toolEndSeen(b: Board, agentId: string | undefined, t: number): void {
+  if (agentId || t <= (b.lastToolEnd ?? 0)) return
+  b.lastToolEnd = t
+}
+
+// Forwards a model stream, calling `seen` as each chunk arrives. Values sent
+// in and errors thrown in reach the source, and closing early closes it, but
+// unlike yield* the source's return value on an early close is dropped, and a
+// thenable chunk would be awaited (model chunks are plain objects). A failing
+// `seen` never stops the stream.
+export async function* streamed<T, R>(source: AsyncGenerator<T, R, unknown>, seen: () => void): AsyncGenerator<T, R, unknown> {
+  let finished = false
+  try {
+    let r = await source.next()
+    while (!r.done) {
+      try {
+        seen()
+      } catch {}
+      let sent: unknown
+      try {
+        sent = yield r.value
+      } catch (err) {
+        r = await source.throw(err)
+        continue
+      }
+      r = await source.next(sent)
+    }
+    finished = true
+    return r.value
+  } finally {
+    if (!finished) await source.return(undefined as R)
+  }
 }
 
 // What a board_status call reported, cleaned by progressOf. Each report
@@ -263,16 +314,34 @@ export function summarize(tool: string, input: Record<string, unknown>): string 
 
 // "/deliver-story 1234" -> { name, args }. A slash command reaches the
 // turn as markup: <command-name>/x</command-name> ... <command-args>y</command-args>.
+// The args come back whole, so a work item at the end of a long prompt is still
+// read; whoever stores or shows them clips them.
 export function slashCommand(text: string): { name: string; args: string } | null {
   const tagged = text.match(/<command-name>\/?([^<]+)<\/command-name>/)
   if (tagged?.[1]) {
     const args = text.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1] ?? ''
-    return { name: tagged[1].trim(), args: clip(args, 200) }
+    return { name: tagged[1].trim(), args }
   }
   const tag = text.match(/^\s*<command-message>([^<]+)<\/command-message>/)
   if (tag?.[1]) return { name: tag[1].trim(), args: '' }
   const m = text.trim().match(/^\/([\w:.-]+)(?:\s+([\s\S]*))?$/)
-  return m?.[1] ? { name: m[1], args: clip(m[2] ?? '', 200) } : null
+  return m?.[1] ? { name: m[1], args: m[2] ?? '' } : null
+}
+
+// Built-in commands that tend to the session rather than start a task. They
+// neither replace the recorded skill nor clear its progress report. /clear is
+// not one: it ends the task, and the board is made fresh after it, nor is
+// /rewind, which changes it. Names a user skill could well have (status,
+// export, usage, …) are left out, so such a skill still counts as a new task.
+const HOUSEKEEPING_COMMANDS = new Set([
+  'reload-plugins', 'rename', 'model', 'fast', 'effort', 'config', 'compact', 'memory', 'permissions',
+  'allowed-tools', 'hooks', 'mcp', 'plugin', 'plugins', 'agents', 'skills', 'theme', 'output-style',
+  'statusline', 'keybindings', 'vim', 'ide', 'doctor', 'login', 'logout', 'add-dir', 'release-notes',
+  'privacy-settings', 'terminal-setup', 'btw', 'exit',
+])
+
+export function housekeepingCommand(name: string): boolean {
+  return HOUSEKEEPING_COMMANDS.has(name.trim().replace(/^\//, '').toLowerCase())
 }
 
 // ---- Messages between sessions ---------------------------------------------
@@ -331,6 +400,77 @@ export function addMessage(board: Board, rec: MessageRec): boolean {
   return true
 }
 
+// The work item a skill's args name. Only a skill that takes a work item
+// reads a bare number or an issue URL as one: a delivery or an orchestration,
+// by name ("deliver", "deliver-story", "gh-issue-delivery",
+// "work-item-delivery", "orchestrate-delivery", with or without a plugin
+// prefix). "#1234" names a work item for any skill but one that takes a PR,
+// so neither "/code-review high 1234" nor "/code-review #1234" gives one.
+// /loop and /schedule give the work item of the command they run when one
+// opens their args ("5m /work-item-delivery 25229"), else a "#1234" in them.
+// Those three lists of names are the defaults; skills.json in the board
+// folder can replace any of them (skillRulesOf).
+export type SkillRules = { workItem: RegExp[]; pr: RegExp[]; wrapper: RegExp[] }
+
+export const DEFAULT_SKILL_RULES: SkillRules = {
+  workItem: [/(?:^|[-:])(?:deliver(?:y|-story)?|orchestrate(?:-delivery)?)$/i],
+  pr: [/(?:^|[-:])(?:review|ultrareview|pr|simplify)$/i],
+  wrapper: [/(?:^|:)(?:loop|schedule)$/i],
+}
+
+// skills.json: { "workItem": [...], "pr": [...], "wrapper": [...] }, each an
+// optional list of case-insensitive regular expressions tried on the skill's
+// name (plugin prefix included). A list given replaces that list's default,
+// so it can drop a name the default matches; [] matches nothing. A key left
+// out, or not a list of strings, keeps its default. A bad regex skips that
+// entry only, so a list where none compile matches nothing, as [] does: a
+// typo never brings back a name the list was written to drop.
+// Each thing it can't use (a file that isn't an object, an unknown key, a
+// value that isn't a list of strings, a pattern that doesn't compile) goes
+// into ignored, worded to say what that leaves, so the board can show it.
+export function skillRulesOf(json: unknown, ignored: string[] = []): SkillRules {
+  const rules = { ...DEFAULT_SKILL_RULES }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    ignored.push('not a JSON object, so every default applies')
+    return rules
+  }
+  const keys = ['workItem', 'pr', 'wrapper'] as const
+  for (const key of Object.keys(json))
+    if (!(keys as readonly string[]).includes(key)) ignored.push(`unknown key ${clip(JSON.stringify(key), 42)} ignored`)
+  for (const key of keys) {
+    if (!(key in json)) continue
+    const list = (json as Record<string, unknown>)[key]
+    if (!Array.isArray(list) || !list.every((p) => typeof p === 'string')) {
+      ignored.push(`"${key}" is not a list of strings, so its default applies`)
+      continue
+    }
+    const own: RegExp[] = []
+    for (const p of list as string[]) {
+      try {
+        own.push(new RegExp(p, 'i'))
+      } catch {
+        ignored.push(`"${key}" pattern ${clip(JSON.stringify(p), 42)} doesn't compile, skipped`)
+      }
+    }
+    rules[key] = own
+  }
+  return rules
+}
+
+const matchesAny = (list: RegExp[], name: string) => list.some((r) => r.test(name))
+
+export function skillTakesWorkItem(name: string, rules: SkillRules = DEFAULT_SKILL_RULES): boolean {
+  return matchesAny(rules.workItem, name)
+}
+
+export function skillWorkItem(name: string, args: string, rules: SkillRules = DEFAULT_SKILL_RULES, depth = 0): string | null {
+  if (skillTakesWorkItem(name, rules)) return workItemOf(args, true)
+  if (matchesAny(rules.pr, name)) return null
+  const inner = depth < 2 && matchesAny(rules.wrapper, name) ? args.match(/^\s*(?:\S+\s+)?\/([\w:.-]+)(?:\s+([\s\S]*))?$/) : null
+  if (inner?.[1]) return skillWorkItem(inner[1], inner[2] ?? '', rules, depth + 1)
+  return workItemOf(args, false)
+}
+
 // A work item id: "#1234" anywhere, or in skill args a GitHub issue URL (its
 // number, without the repo, as plan items name it) or a bare 4–7 digit number.
 // /deliver from orchestrate-delivery names its issue by URL, and GitHub issue
@@ -340,6 +480,61 @@ export function addMessage(board: Board, rec: MessageRec): boolean {
 // taken for a year unless it opens the args ("/deliver 2045"). "#2026" on its
 // own still counts: it names an item. An Azure DevOps work item URL in skill
 // args gives its id, like a GitHub issue URL.
+// A "#" in a URL or glued to a word ("page#2345", "WI#2345", "page-#2345")
+// is no item, but Azure Boards' "AB#1234", which links commits and PRs to
+// work items, and a GitHub "owner/repo#1234" are. A path like "docs/spec#12"
+// can't be told from owner/repo, so it counts too.
+// What may come right before a "#": nothing, or a character that can't be in
+// a word, path or URL, then "AB" or a GitHub owner (no dots) and repo.
+const HASH_PREFIX = /^(?:[\s\S]*[^\w/.:-])?(?:[Aa][Bb]|[\w-]+\/[\w.-]+)?$/
+
+// Whether the "#" at index starts a reference: the run of non-space text
+// before it, looked at no further back than 200 characters so a long prompt
+// stays cheap, is no URL and fits HASH_PREFIX.
+function hashRef(text: string, index: number): boolean {
+  const token = text.slice(Math.max(0, index - 200), index).split(/\s/).pop() ?? ''
+  return !token.includes('://') && HASH_PREFIX.test(token)
+}
+
+// A card or phone number gives no item, though a group of it looks like one.
+// Looked at are three or more groups in a row of at most four digits, joined
+// by up to three of "-" or spaces, where a date ("2026-10-31") ends the row.
+// They are a number with a "-" among them ("1234-5678-9012", "08-1234 5678"),
+// when they open with a shorter group and end with one of four ("555 123
+// 4567", "+46 8 1234 5678"), or as four groups of four ("1234 5678 9012
+// 3456"). An item beside one still counts ("1234 5678 9012 3456 25229"), and
+// so do pairs and lists of items ("25229-25231", "30395-30396-30397",
+// "4512 4513 4514", "4512 2 3"), but four 4-digit items in a row read as a
+// card, and three joined by "-" as a phone number.
+// Gives where each group of such a number starts.
+function phoneGroups(text: string): Set<number> {
+  const found = new Set<number>()
+  for (const m of text.matchAll(/(?<![\w/.-])\d+(?:[- \t\u00a0]{1,3}\d+)+/g)) {
+    const groups: { at: number; len: number; date: boolean }[] = []
+    for (const token of m[0].matchAll(/[^ \t\u00a0]+/g)) {
+      const date = DATE.test(token[0])
+      for (const g of token[0].matchAll(/\d+/g))
+        groups.push({ at: m.index + token.index + g.index, len: g[0].length, date })
+    }
+    let from = 0
+    for (let i = 0; i <= groups.length; i++) {
+      const group = groups[i]
+      if (group && group.len <= 4 && !group.date) continue
+      const row = groups.slice(from, i)
+      const head = row[0]
+      const tail = row[row.length - 1]
+      if (head && tail && row.length >= 3) {
+        const dashed = text.slice(head.at, tail.at + tail.len).includes('-')
+        const phone = head.len < 4 && tail.len === 4
+        const card = row.length === 4 && row.every((g) => g.len === 4)
+        if (dashed || phone || card) for (const g of row) found.add(g.at)
+      }
+      from = i + 1
+    }
+  }
+  return found
+}
+
 const DATE = /^(?:(?:19|20)\d\d(?:[-/.]\d{1,2}){1,2}|(?:\d{1,2}[-/.]){1,2}(?:19|20)\d\d)$/
 
 export function workItemOf(text: string, allowBare: boolean): string | null {
@@ -347,18 +542,21 @@ export function workItemOf(text: string, allowBare: boolean): string | null {
     ? text.match(/https:\/\/(?:github\.com\/[\w.-]+\/[\w.-]+\/issues|\S+\/_workitems\/edit)\/(\d{1,7})\b/i)
     : null
   if (url?.[1]) return url[1]
+  const phone = phoneGroups(text)
   for (const m of text.matchAll(/#(\d{3,7}(?:[-/.]\d+)*)(?!\w)/g)) {
     const run = m[1] ?? ''
-    if (!DATE.test(run)) return run.split(/[-/.]/)[0] ?? null
+    const parts = run.split(/[-/.]/)
+    if (!hashRef(text, m.index) || DATE.test(run) || phone.has(m.index + 1) || parts.some((p) => p.length > 7)) continue
+    return parts[0] ?? null
   }
   if (!allowBare) return null
   const first = text.search(/\S/)
-  for (const m of text.matchAll(/(?<![\w/.-])(\d+(?:[-/.]\d+)*)(?!\w)/g)) {
+  for (const m of text.matchAll(/(?<![\w/.#-])(\d+(?:[-/.]\d+)*)(?!\w)/g)) {
     // A list or range of items ("25229/25230") gives its first; a run with a
     // shorter part is a version, decimal or date, never an item.
     const run = m[1] ?? ''
     const parts = run.split(/[-/.]/)
-    if (DATE.test(run) || parts.some((p) => p.length < 4 || p.length > 7)) continue
+    if (DATE.test(run) || phone.has(m.index) || parts.some((p) => p.length < 4 || p.length > 7)) continue
     for (const [i, part] of parts.entries()) {
       const year = part.length === 4 && Number(part) >= 1900 && Number(part) <= 2099
       if (!year || (m.index === first && i === 0)) return part
@@ -1243,6 +1441,7 @@ export function freshBoard(sessionId: string, cwd: string, now: number): Board {
     shells: [],
     messages: [],
     done: null,
+    lastToolEnd: null,
   }
 }
 

@@ -237,7 +237,7 @@ from any page but the board itself.
 | **needs you** (pink, glowing, sorted first) | a question or a plan waiting for approval (not a permission prompt: Claude Code skips the hooks that would see one) |
 | **running** (cyan sweep) | the main loop is working on a prompt |
 | **agents running** (purple sweep) | your turn is over, but background subagents are still working |
-| **stalled** (yellow, the sweep stops) | still running and its heartbeat arrives, but a main-loop tool has run past its limit (Bash, PowerShell and REPL 20 min, Poll, Agent and Workflow 60 min, WebFetch and WebSearch 3 min, others 5 min), or nothing is in flight and the page has seen nothing new for 10 min. The limits are `TOOL_LIMIT_MS` and `STALL_MS` in `dashboard/index.html` |
+| **stalled** (yellow, the sweep stops) | still running and its heartbeat arrives, but a main-loop tool has run past its limit (Bash, PowerShell and REPL 20 min, Poll, Agent and Workflow 60 min, WebFetch and WebSearch 3 min, others 5 min), or nothing is in flight and the page has seen nothing new for 10 min (the model streaming an answer counts as new: the hooks note each chunk in `lastStepAt`). A page that loads later counts the 10 min from the newest time in the file, `lastToolEnd` (when a main-loop tool last ended) included; a file from hooks older than that field, or one waiting on a foreground Agent call, counts from when the page first sees it. The limits are `TOOL_LIMIT_MS` and `STALL_MS` in `dashboard/index.html` |
 | **idle** | done, your move |
 | ended / no heartbeat | under "Ended or gone"; no heartbeat for 20 s means the session crashed or was closed |
 
@@ -268,12 +268,19 @@ approve, with its text). Clicking it brings the board forward with that
 session's drawer open. It notifies once per wait (a plan's gate counts as one
 wait however many short turns run while it's open), and not for sessions that
 were already waiting when the page loaded. **long turns** adds one when a turn
-that ran 3 minutes or longer ends. **mute** silences both. Both stay set in the
-browser. A permission prompt still can't be seen (see the table above), and
+that ran 3 minutes or longer ends. **stalls** adds one when a running tile
+turns stalled (yellow): the overdue tool and how long it has run, or how long
+the session has been quiet. It notifies once per stall, not for sessions that
+were already stalled when the page loaded, and is off by default since the
+stall limits are guesses. **mute** silences them all. The choices stay set in
+the browser. A permission prompt still can't be seen (see the table above), and
 the page has to be open in a tab, served from `127.0.0.1` or `localhost`
 (browsers allow notifications only there or over HTTPS). A tab in the
-background polls every 15 s, and browsers slow its timers further after a few
-minutes, so a notification can come up to a minute late.
+background polls every 15 s, so a notification can come up to 15 s late. A
+worker times those polls, because browsers slow a background tab's own timers
+to about once a minute. A tab the browser puts to sleep (Edge's sleeping tabs,
+Chrome's Memory Saver) doesn't poll at all, so exempt the board's address
+there.
 
 On Windows a tile also shows the session's memory: its `claude.exe` plus
 everything it started (MCP servers, running shell commands), sampled once a
@@ -314,7 +321,9 @@ phase while the session is at work (running, waiting or in the background; an
 idle tile drops it), and the drawer shows it with when it was reported. Each call replaces the last
 report, and only the main conversation's reports count, not a subagent's. A
 progress report never marks the task done. `done`, a slash command other than
-the running skill or `/clear` clears it. The skill has to be told to call it; nothing
+the running skill or `/clear` clears it. Built-in housekeeping commands such as
+`/reload-plugins`, `/rename` or `/model` don't, and don't replace the recorded
+skill or prompt, or count as the go for a plan. The skill has to be told to call it; nothing
 here makes it.
 
 Without a report, phases come from the newest running subagent's type, then
@@ -344,8 +353,37 @@ regular expressions:
 The dashboard reads it once when the page loads; reload the page after editing.
 A missing or broken file leaves the defaults.
 
-The work item is taken from the skill's arguments (`deliver 1234` →
-`#1234`) or a `#1234` in the prompt.
+The work item is taken from the arguments of a delivery or orchestrate skill
+(`/deliver 1234` → `#1234`) or a `#1234` in the prompt. Another skill's bare
+number is not a work item, and neither is any number given to a review or PR
+skill, such as the PR in `/code-review high 1234` or `/code-review #1234`.
+
+Which skills count as which goes by name. Out of the box a delivery or
+orchestrate skill is one whose name ends in `deliver`, `delivery`,
+`deliver-story`, `orchestrate` or `orchestrate-delivery`; a review or PR skill
+ends in `review`, `ultrareview`, `pr` or `simplify`; and `/loop` and
+`/schedule` give the work item of the command they run. To change that, put a
+`skills.json` in the board folder (`~/.claude/board/skills.json`):
+
+```json
+{
+  "workItem": ["(^|[-:])(deliver|delivery|orchestrate)$", "^deliver-issue$", "^implement-story$"],
+  "pr": ["(^|[-:])(review|pr)$"],
+  "wrapper": ["^(loop|schedule)$"]
+}
+```
+
+Each entry is a case-insensitive regular expression tried on the skill's name,
+plugin prefix included. A list you give replaces that list's default, so you
+can also drop a name the default matches (such as `order-delivery`); `[]`
+matches nothing. A list you leave out keeps its default, and a bad expression
+is skipped, so a list where none compile matches nothing too. The hooks run
+them on every slash command, so keep them short and anchored. Sessions read the
+file when they start, after `/clear` or after `/reload-plugins`. A missing
+file leaves the defaults, and so does one that isn't valid JSON, which the
+session's events on the board say. They also name what the file ignored: a key
+other than these three, a value that isn't a list of strings (its default
+stays), and an expression that doesn't compile.
 
 ## Sessions in a sandbox
 

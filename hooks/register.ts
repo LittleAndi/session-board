@@ -13,6 +13,9 @@ import {
   QUIET_TOOLS,
   addMessage,
   addPrs,
+  stepSeen,
+  streamed,
+  toolEndSeen,
   adoPrLink,
   adoPrShowArgv,
   cacheTtlOf,
@@ -48,7 +51,12 @@ import {
   sessionTitleOf,
   shellReported,
   shellToolDone,
+  skillWorkItem,
+  skillRulesOf,
+  DEFAULT_SKILL_RULES,
+  type SkillRules,
   slashCommand,
+  housekeepingCommand,
   summarize,
   toolLabel,
   trimAgents,
@@ -346,6 +354,32 @@ async function removeFiles($: EngineInterface, paths: string[]) {
   } catch {}
 }
 
+// skills.json in the board folder, read at each load before the board is
+// ready, so a session's first prompt already gets its rules. A missing file
+// leaves the default skill rules, and so does a broken one. The answer is the
+// lines for the board's events: why a file is unreadable, or one line for
+// each part skillRulesOf can't use, so a long list isn't cut short.
+let skillRules: SkillRules = DEFAULT_SKILL_RULES
+
+async function loadSkillRules($: EngineInterface, dir: string): Promise<string[]> {
+  const path = `${dir}/skills.json`
+  try {
+    if (!(await $.fs.exists(path))) {
+      skillRules = DEFAULT_SKILL_RULES
+      return []
+    }
+    // Windows PowerShell and Notepad can save it with a byte-order mark.
+    const ignored: string[] = []
+    skillRules = skillRulesOf(JSON.parse((await $.fs.read(path)).replace(/^\u{FEFF}/u, '')), ignored)
+    // A file wrong all over still leaves room for the session's own events.
+    const shown = ignored.length > 5 ? [...ignored.slice(0, 4), `and ${ignored.length - 4} more`] : ignored
+    return shown.map((reason) => `skills.json: ${reason}`)
+  } catch (e) {
+    skillRules = DEFAULT_SKILL_RULES
+    return [`skills.json unreadable, default skill rules apply: ${clip(String(e), 120)}`]
+  }
+}
+
 // The served dashboard always matches the one this plugin ships.
 async function copyDashboard($: EngineInterface, dir: string) {
   try {
@@ -360,6 +394,7 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
   const dir = await boardDir($)
   const id = await $.session.id()
   file = `${dir}/sessions/${id}.json`
+  const skillsNotes = await loadSkillRules($, dir)
 
   // A reload of this module mid-session keeps what the file already says.
   let previous: Board | null = null
@@ -368,8 +403,9 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
   } catch {}
 
   board = previous && previous.state !== 'ended' ? previous : freshBoard(id, cwd, now())
-  // After /clear (or a resume) the process's cost can carry on from the ended
-  // board, so its day baseline carries on too, or today would count it all.
+  // `claude --resume` keeps the session id and its cost carries on from the
+  // ended board (checked in #63), so the day baseline carries on too, or today
+  // would count it all. /clear never gets here: it gives the session a new id.
   if (previous && board !== previous) {
     board.costUsd = previous.costUsd ?? null
     // A file from older hooks has no baseline: what it had counts as spent
@@ -403,6 +439,7 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
     board.repo = repo ? { name: repo.name, root: repo.root, remote: repo.remote } : null
   } catch {}
   event('session', previous && previous.state !== 'ended' ? 'board reloaded' : reason)
+  for (const note of skillsNotes) event('session', note)
 
   try {
     boardTool = (await $.tool.register({ ...BOARD_STATUS_TOOL, isDeferred: false })).tool
@@ -496,9 +533,10 @@ function setSkill(name: string, args: string) {
   if (!board || !name) return
   board.activeSkill = name
   if (!skillSetThisTurn || !board.skill) {
-    board.skill = { name, args, at: now() }
+    // The work item comes from the whole args; only the stored copy is clipped.
+    board.skill = { name, args: clip(args, 200), at: now() }
     skillSetThisTurn = true
-    board.workItem = workItemOf(args, true) ?? board.workItem
+    board.workItem = skillWorkItem(name, args, skillRules) ?? board.workItem
   }
   event('skill', `${name} ${args}`)
 }
@@ -534,9 +572,18 @@ async function turnStarted($: EngineInterface, text: string) {
   mainRunning = true
   mainTurnId = null
   skillSetThisTurn = false
+  const handback = /^\s*<(agent-message|task-notification)[\s>]/.test(text)
+  // A housekeeping command such as /rename tends to the session: it is no new
+  // task, no turn of work and no reply, so it leaves the board as it was.
+  const slash = handback || crossSessionMessage(text) ? null : slashCommand(text)
+  if (slash && housekeepingCommand(slash.name)) {
+    event('session', `/${slash.name} ${slash.args}`.trim())
+    notePrs(prLinksOf(text))
+    schedule($)
+    return
+  }
   b.turns++
   b.waiting = null
-  const handback = /^\s*<(agent-message|task-notification)[\s>]/.test(text)
   const fired = cronFired(b, text, now())
   if (fired) event('turn', `${fired.human} fired`)
   // Another session's message or a notice about one: not the person's prompt.
@@ -553,7 +600,6 @@ async function turnStarted($: EngineInterface, text: string) {
     event(shell ? 'tool' : 'agent', shell ? `background done: ${shell.summary}` : `report from ${agentName(from) ?? 'a subagent'}`)
     notePrs(prLinksOf(text), agentName(from))
   } else if (text.trim()) {
-    const slash = slashCommand(text)
     const shown = slash ? `/${slash.name} ${slash.args}`.trim() : text
     b.prompt = clip(shown, 600)
     b.promptAt = now()
@@ -569,7 +615,9 @@ async function turnStarted($: EngineInterface, text: string) {
     // A prompt after done leaves done standing: the task is the model's to
     // reopen with board_status "working", the activity is ours.
     notePrs(prLinksOf(text))
-    b.workItem = workItemOf(shown, false) ?? b.workItem
+    // A slash command's work item is the skill's (setSkill above): a "#1234"
+    // in /code-review's args is a PR.
+    if (!slash) b.workItem = workItemOf(shown, false) ?? b.workItem
   }
   schedule($)
 }
@@ -652,6 +700,7 @@ async function toolStarted($: EngineInterface, tool: string, input: Record<strin
 
 function toolEnded($: EngineInterface, rec: ToolRec, tool: string, outcome: 'ok' | 'denied' | 'failed', prs: Omit<PrRec, 'at'>[]) {
   tools.delete(rec.id)
+  if (board) toolEndSeen(board, rec.agentId, now())
   notePrs(prs, agentName(rec.agentId))
   if (outcome === 'denied') event('error', `${rec.tool} denied`, agentName(rec.agentId))
   if (outcome === 'failed') event('error', `${rec.tool} failed${rec.summary ? `: ${rec.summary}` : ''}`, agentName(rec.agentId))
@@ -707,15 +756,25 @@ export const register: Register = (on) => {
   })
 
   // A model request; it streams, so the hook forwards the chunks as they come.
+  // The main thread's chunks also move lastStepAt on, which the heartbeat writes.
   on('turn.step', async function* ($, e, next) {
     const sent = now()
-    const result = yield* next(e)
+    const seen = () => {
+      if (board) stepSeen(board, e.agentId, now())
+    }
+    seen()
+    const result = yield* (e.agentId ? next(e) : streamed(next(e), seen))
     try {
       if (!e.agentId && result.usage) cacheUsed($, sent, result.usage)
     } catch {}
     return result
   }).catch(async function* ($, e, next) {
-    return yield* next(e) // the board only observes: on failure the request goes on
+    // The board only observes: on failure the request goes on. Once next has
+    // been called, the failure can be the model stream's own, and there next(e)
+    // would send the request again after its first chunks were shown (#73), so
+    // the hook steps aside and the failure goes on as it would without the board.
+    if (next.called) throw new Error(next.error.message ?? 'turn.step failed')
+    return yield* next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -734,9 +793,13 @@ export const register: Register = (on) => {
   }).catch(($, e, next) => next(e)) // the board only observes: on failure the call goes on
 
   on('tool.call', async ($, e, next) => {
-    if (e.tool === boardTool) return { result: await boardStatusCalled($, e as unknown as Record<string, unknown>) }
-    if (e.tool === queueTool) return { result: await boardQueueCalled($, e as unknown as Record<string, unknown>) }
-    if (e.tool === planTool) return { result: await boardPlanCalled($, e as unknown as Record<string, unknown>) }
+    if (e.tool === boardTool || e.tool === queueTool || e.tool === planTool) {
+      const input = e as unknown as Record<string, unknown>
+      const result = e.tool === boardTool ? await boardStatusCalled($, input)
+        : e.tool === queueTool ? await boardQueueCalled($, input) : await boardPlanCalled($, input)
+      if (board) toolEndSeen(board, e.agentId, now()) // the heartbeat writes it
+      return { result }
+    }
     const rec = await toolStarted($, e.tool, e as unknown as Record<string, unknown>, e.tool_use_id, e.agentId)
     if (!rec) return next(e)
     let outcome: 'ok' | 'denied' | 'failed' = 'failed'

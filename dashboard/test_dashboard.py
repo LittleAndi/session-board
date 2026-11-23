@@ -404,9 +404,78 @@ class MessagesView(unittest.TestCase):
         self.page.goto(self.url)
         self.page.wait_for_selector(f'[data-session="{S2}"]')
         self.assertNotIn('stalled', self.tile(S2).get_attribute('class'))
-        self.page.clock.run_for(11 * MIN)
+        # The page redraws times on a 1 s interval that started before it saw
+        # the session, so the last redraw within 11 minutes can fall just short
+        # of 11 minutes after that sight. Two seconds more always reach it.
+        self.page.clock.run_for(11 * MIN + 2_000)
         self.page.wait_for_function(f'''document.querySelector('.tile[data-session="{S2}"]').classList.contains('stalled')''')
         self.assertTrue(self.tile(S2).locator('.since').inner_text().startswith('stalled · quiet 11m'))
+
+    def test_quiet_counts_from_the_last_tool_end_when_the_file_has_it(self):
+        # Hooks that write lastToolEnd let a page that loads late count from the
+        # file: quiet for 14 minutes by its file, it is stalled at first sight.
+        path = Path(self.dir.name) / 'sessions' / f'{S2}.json'
+        before = path.read_text(encoding='utf-8')
+        b = json.loads(before)
+        # From now, not the fixture's time: the suite may have run a while since.
+        b['lastToolEnd'] = int(time.time() * 1000) - 14 * MIN
+        path.write_text(json.dumps(b), encoding='utf-8')
+        try:
+            self.page.close()
+            self.page = self.browser.new_page(viewport={'width': 1400, 'height': 1000})
+            self.page.on('pageerror', lambda e: self.errors.append(str(e)))
+            self.page.goto(self.url)
+            self.page.wait_for_selector(f'[data-session="{S2}"]')
+            self.page.wait_for_function(f'''document.querySelector('.tile[data-session="{S2}"]').classList.contains('stalled')''')
+            self.assertTrue(self.tile(S2).locator('.since').inner_text().startswith('stalled · quiet 14m'))
+        finally:
+            path.write_text(before, encoding='utf-8')
+
+    def test_an_agent_call_in_flight_counts_from_first_sight(self):
+        # The main loop waits on a subagent whose Reads leave no time in the
+        # file, so even with lastToolEnd the page counts from when it loads.
+        path = Path(self.dir.name) / 'sessions' / f'{S2}.json'
+        before = path.read_text(encoding='utf-8')
+        b = json.loads(before)
+        t = int(time.time() * 1000)
+        b['lastToolEnd'] = t - 70 * MIN
+        b['tools'] = [{'id': 'ta', 'tool': 'Agent', 'summary': 'explore', 'since': t - 70 * MIN}]
+        path.write_text(json.dumps(b), encoding='utf-8')
+        try:
+            self.page.close()
+            self.page = self.browser.new_page(viewport={'width': 1400, 'height': 1000})
+            self.page.on('pageerror', lambda e: self.errors.append(str(e)))
+            self.page.goto(self.url)
+            self.page.wait_for_selector(f'[data-session="{S2}"]')
+            self.page.wait_for_timeout(2500)
+            self.assertNotIn('stalled', self.tile(S2).get_attribute('class'))
+        finally:
+            path.write_text(before, encoding='utf-8')
+
+    def test_a_streamed_answer_counts_as_activity(self):
+        # No tool in flight for 12 minutes, but the model streamed 6 minutes in:
+        # lastStepAt moved on, so the page saw something new and doesn't stall.
+        path = Path(self.dir.name) / 'sessions' / f'{S2}.json'
+        before = path.read_text(encoding='utf-8')
+        self.page.close()
+        self.page = self.browser.new_page(viewport={'width': 1400, 'height': 1000})
+        self.page.on('pageerror', lambda e: self.errors.append(str(e)))
+        self.page.clock.install()
+        self.page.goto(self.url)
+        self.page.wait_for_selector(f'[data-session="{S2}"]')
+        try:
+            self.page.clock.run_for(6 * MIN)
+            self.page.wait_for_timeout(500)
+            b = json.loads(before)
+            b['lastStepAt'] = b['updatedAt'] + 6 * MIN
+            path.write_text(json.dumps(b), encoding='utf-8')
+            self.page.clock.run_for(3_000)  # the next poll reads it
+            self.page.wait_for_timeout(1000)
+            self.page.clock.run_for(6 * MIN)
+            self.page.wait_for_timeout(500)
+            self.assertNotIn('stalled', self.tile(S2).get_attribute('class'))
+        finally:
+            path.write_text(before, encoding='utf-8')
 
     def test_a_tool_that_ends_counts_as_activity(self):
         # The build ends: it leaves `tools` and writes no event, so the file's
@@ -435,13 +504,15 @@ class MessagesView(unittest.TestCase):
         window.Notification = N
     })()'''
 
-    def notify_page(self, perm='granted', **stored):
+    def notify_page(self, perm='granted', init='', **stored):
         self.page.close()
         self.page = self.browser.new_page(viewport={'width': 1400, 'height': 1000})
         self.page.on('pageerror', lambda e: self.errors.append(str(e)))
         sets = ''.join(f"localStorage.setItem('{k}', '{v}');" for k, v in {'test.perm': perm, **stored}.items())
         self.page.add_init_script(f'(() => {{ {sets} }})()')
         self.page.add_init_script(self.STUB)
+        if init:
+            self.page.add_init_script(init)
         self.page.goto(self.url)
         self.page.wait_for_selector(f'[data-session="{A}"]')
         self.page.wait_for_timeout(300)
@@ -503,6 +574,74 @@ class MessagesView(unittest.TestCase):
         self.assertEqual(note['title'], 'Turn ended: pipelines · build ends')
         self.assertRegex(note['body'], r'^Ran 15m( \d\ds)? · Fix the thing\.$')
 
+    def test_a_stall_notifies_only_when_asked_for_and_once(self):
+        # Off by default: S3's build runs past its limit without a notification.
+        self.notify_page()
+        self.assertEqual(self.page.get_attribute('#notify-stall', 'aria-pressed'), 'false')
+        now = int(time.time() * 1000)
+        self.rewrite(S3, tools=[{'id': 't3', 'tool': 'Bash', 'summary': 'dotnet build', 'since': now - 25 * MIN}])
+        self.page.wait_for_function(f'''document.querySelector('.tile[data-session="{S3}"]').classList.contains('stalled')''')
+        self.page.wait_for_timeout(500)
+        self.assertEqual(self.notes(), [])
+        # Turned on: S6's test run goes past its limit and notifies once. S1 and
+        # S3, stalled before, stay quiet.
+        self.page.click('#notify-stall')
+        self.assertEqual(self.page.get_attribute('#notify-stall', 'aria-pressed'), 'true')
+        self.assertEqual(self.page.evaluate("localStorage.getItem('sessionBoard.notifyStall')"), '1')
+        self.rewrite(S6, tabTitle='tests', tools=[{'id': 't6', 'tool': 'REPL', 'summary': 'npm test', 'since': now - 22 * MIN}])
+        self.page.wait_for_function('notes.length > 0')
+        self.page.wait_for_timeout(2500)  # another poll: still one
+        [note] = self.notes()
+        self.assertEqual(note['title'], 'Looks stalled: pipelines · tests')
+        self.assertRegex(note['body'], r'^REPL running for 22m \d\ds · Fix the thing\.$')
+        # A poll where it doesn't look stalled, then back with the same overdue
+        # tool, is the same stall: still one notification.
+        tool = [{'id': 't6', 'tool': 'REPL', 'summary': 'npm test', 'since': now - 22 * MIN}]
+        self.rewrite(S6, tabTitle='tests', state='idle', tools=tool)
+        self.page.wait_for_function(f'''!document.querySelector('.tile[data-session="{S6}"]').classList.contains('stalled')''')
+        self.rewrite(S6, tabTitle='tests', state='running', tools=tool)
+        self.page.wait_for_function(f'''document.querySelector('.tile[data-session="{S6}"]').classList.contains('stalled')''')
+        self.page.wait_for_timeout(2500)
+        self.assertEqual(len(self.notes()), 1)
+        self.page.evaluate('notes[0].onclick()')
+        self.settled()
+        self.assertTrue(self.page.evaluate('notes[0].closed'))
+        self.assertIn('looks stalled: REPL has run longer than 20 min', self.page.inner_text('#d-body'))
+
+    def test_a_quiet_stall_says_how_long(self):
+        # S2 has nothing in flight; the page counts from when it saw the file
+        # change, and notifies once it has been quiet past the limit.
+        self.page.close()
+        self.page = self.browser.new_page(viewport={'width': 1400, 'height': 1000})
+        self.page.on('pageerror', lambda e: self.errors.append(str(e)))
+        self.page.add_init_script("localStorage.setItem('test.perm', 'granted'); localStorage.setItem('sessionBoard.notifyStall', '1')")
+        self.page.add_init_script(self.STUB)
+        self.page.clock.install()
+        self.page.goto(self.url)
+        self.page.wait_for_selector(f'[data-session="{S2}"]')
+        self.page.wait_for_timeout(300)
+        # Counted from first sight, the quiet may have begun before the page
+        # loaded: the tile turns stalled, but nothing notifies.
+        self.page.clock.run_for(11 * MIN + 2_000)
+        self.page.wait_for_function(f'''document.querySelector('.tile[data-session="{S2}"]').classList.contains('stalled')''')
+        self.page.wait_for_timeout(500)
+        self.assertEqual([n for n in self.notes() if n['title'].endswith('gone quiet')], [])
+        # A streamed answer is something the page saw happen; quiet from then on notifies.
+        path = Path(self.dir.name) / 'sessions' / f'{S2}.json'
+        before = path.read_text(encoding='utf-8')
+        self.addCleanup(path.write_text, before, encoding='utf-8')
+        b = json.loads(before)
+        b['lastStepAt'] = b['updatedAt']
+        path.write_text(json.dumps(b), encoding='utf-8')
+        self.page.clock.run_for(3_000)  # the next poll reads it
+        self.page.wait_for_function(f'''!document.querySelector('.tile[data-session="{S2}"]').classList.contains('stalled')''')
+        self.page.clock.run_for(11 * MIN + 2_000)
+        self.page.wait_for_function('notes.some((n) => n.title.endsWith("gone quiet"))')
+        titles = [n['title'] for n in self.notes()]
+        self.assertEqual(titles.count('Looks stalled: pipelines · gone quiet'), 1)
+        body = next(n['body'] for n in self.notes() if n['title'].endswith('gone quiet'))
+        self.assertRegex(body, r'^Quiet for 1[01]m \d\ds · Fix the thing\.$')
+
     def test_a_sandboxed_session_never_notifies(self):
         self.notify_page()
         path = Path(self.dir.name) / 'sandboxed' / f'{X}.json'
@@ -517,8 +656,10 @@ class MessagesView(unittest.TestCase):
         self.assertEqual(self.notes(), [])
 
     def test_a_turn_counts_its_background_agents_but_not_a_wait_for_you(self):
-        self.notify_page(**{'sessionBoard.notifyLong': '1'})
+        # From now, not the fixture's time: the suite may have run a while since.
         now = int(time.time() * 1000)
+        self.rewrite(S3, stateSince=now - 15 * MIN)
+        self.notify_page(**{'sessionBoard.notifyLong': '1'})
         # S3 ran 15 minutes, then waits for you: no "turn ended", and the wait doesn't count.
         self.rewrite(S3, state='waiting', stateSince=now, tools=[], waiting={'kind': 'question', 'detail': 'Which?', 'since': now})
         self.page.wait_for_function('notes.length === 1')
@@ -551,6 +692,47 @@ class MessagesView(unittest.TestCase):
         self.page.wait_for_selector(f'.tile[data-session="{S6}"] .ask')
         self.page.wait_for_timeout(2500)
         self.assertEqual([n['title'] for n in self.notes()], ['Needs you: pipelines · repl test run'])
+
+    def test_a_hidden_tab_polls_from_a_worker_and_still_notifies(self):
+        # The page's own timers slow down in a hidden tab; the worker's don't.
+        # The test shortens the worker's wait so it needn't sit out 15 s.
+        self.notify_page(init='''(() => {
+            Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: () => !!window.testHidden })
+            window.workerWaits = []
+            const post = Worker.prototype.postMessage
+            Worker.prototype.postMessage = function (ms) {
+                if (ms > 0) workerWaits.push(ms)
+                return post.call(this, ms === 15000 ? 300 : ms)
+            }
+            window.pageWaits = []
+            const st = window.setTimeout
+            window.setTimeout = function (fn, ms, ...rest) { pageWaits.push(ms); return st.call(this, fn, ms, ...rest) }
+        })()''')
+        self.page.evaluate('testHidden = true; document.dispatchEvent(new Event("visibilitychange"))')
+        self.page.wait_for_function('workerWaits.length > 1')
+        now = int(time.time() * 1000)
+        self.rewrite(F, state='waiting', stateSince=now, waiting={'kind': 'question', 'detail': 'Which?', 'since': now})
+        self.page.wait_for_function('notes.length > 0', timeout=5000)
+        self.assertNotIn(15000, self.page.evaluate('pageWaits'))
+        self.assertEqual(set(self.page.evaluate('workerWaits')), {15000})
+        # Back in view: the page's own 2 s timer takes over again.
+        self.page.evaluate('testHidden = false; pageWaits.length = 0; document.dispatchEvent(new Event("visibilitychange"))')
+        self.page.wait_for_function('pageWaits.includes(2000)')
+
+    def test_a_hidden_tab_without_a_worker_polls_from_its_own_timer(self):
+        # The test shortens the 15 s wait so it needn't sit it out.
+        self.notify_page(init='''(() => {
+            Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: () => !!window.testHidden })
+            window.Worker = function () { throw new Error('no workers here') }
+            window.pageWaits = []
+            const st = window.setTimeout
+            window.setTimeout = function (fn, ms, ...rest) { pageWaits.push(ms); return st.call(this, fn, ms === 15000 ? 300 : ms, ...rest) }
+        })()''')
+        self.page.evaluate('testHidden = true; document.dispatchEvent(new Event("visibilitychange"))')
+        self.page.wait_for_function('pageWaits.filter((ms) => ms === 15000).length > 1')
+        now = int(time.time() * 1000)
+        self.rewrite(F, state='waiting', stateSince=now, waiting={'kind': 'question', 'detail': 'Which?', 'since': now})
+        self.page.wait_for_function('notes.length > 0', timeout=5000)
 
     def test_permission_is_asked_from_the_button_not_on_load(self):
         self.notify_page(perm='default')
