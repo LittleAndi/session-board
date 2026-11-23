@@ -403,8 +403,9 @@ async function init($: EngineInterface, cwd: string, interactive: boolean, reaso
   } catch {}
 
   board = previous && previous.state !== 'ended' ? previous : freshBoard(id, cwd, now())
-  // After /clear (or a resume) the process's cost can carry on from the ended
-  // board, so its day baseline carries on too, or today would count it all.
+  // `claude --resume` keeps the session id and its cost carries on from the
+  // ended board (checked in #63), so the day baseline carries on too, or today
+  // would count it all. /clear never gets here: it gives the session a new id.
   if (previous && board !== previous) {
     board.costUsd = previous.costUsd ?? null
     // A file from older hooks has no baseline: what it had counts as spent
